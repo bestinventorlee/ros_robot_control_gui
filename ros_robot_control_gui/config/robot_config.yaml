@@ -1,0 +1,39 @@
+# 로봇 제어 시스템 설정 파일
+
+# 기본 동기화 설정
+sync_settings:
+  default_speed: 50.0  # deg/s
+  default_acceleration: 30.0  # deg/s²
+  default_timeout: 10  # seconds
+  min_speed_ratio: 0.1  # 0.01-1.0
+
+# 서보 제한값
+servo_limits:
+  min_angle: -135.0  # degrees
+  max_angle: 135.0   # degrees
+  max_speed: 200.0   # deg/s
+  max_acceleration: 100.0  # deg/s²
+
+# 좌표 제한값
+coordinate_limits:
+  x_min: -500.0  # mm
+  x_max: 500.0   # mm
+  y_min: -500.0  # mm
+  y_max: 500.0   # mm
+  z_min: 0.0     # mm
+  z_max: 1000.0  # mm
+
+# ROS2 토픽 설정
+topics:
+  servo_angles: "servo_angles"
+  robot_coords: "robot_coords"
+  servo_angles_with_speed: "servo_angles_with_speed"
+  robot_coords_with_speed: "robot_coords_with_speed"
+  sync_settings: "sync_settings"
+  servo_status: "servo_status"
+
+# GUI 설정
+gui_settings:
+  window_width: 1200
+  window_height: 800
+  update_rate: 10  # Hz
