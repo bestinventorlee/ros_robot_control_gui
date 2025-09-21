@@ -42,6 +42,9 @@ class RobotControlGUI(Node):
         # ROS2 타이머 생성
         self.timer = self.create_timer(0.1, self.ros_spin)
         
+        # 연결 상태 모니터링 타이머
+        self.connection_timer = self.create_timer(1.0, self.check_connection_status)
+        
         self.get_logger().info('로봇 제어 GUI가 시작되었습니다.')
     
     def setup_gui(self):
@@ -98,6 +101,10 @@ class RobotControlGUI(Node):
         # 연결 상태 표시
         self.connection_label = ttk.Label(button_frame, text="연결 상태: 대기 중...")
         self.connection_label.grid(row=0, column=2, padx=20)
+        
+        # 연결 상태 변수 초기화
+        self.last_message_time = time.time()
+        self.connection_status = "대기 중..."
         
         # 스타일 설정
         style.configure('Emergency.TButton', foreground='red', font=('Arial', 12, 'bold'))
@@ -407,6 +414,9 @@ class RobotControlGUI(Node):
         
         self.angle_pub.publish(msg)
         self.log_message(f"각도 제어 전송: {angles}")
+        
+        # 연결 상태를 "전송 중"으로 표시
+        self.connection_label.config(text="연결 상태: 📤 전송 중...", foreground="blue")
     
     def send_angles_with_speed(self):
         """속도/가속도 포함 각도 제어 메시지 전송"""
@@ -417,8 +427,15 @@ class RobotControlGUI(Node):
         msg = Float32MultiArray()
         msg.data = angles + [speed, accel]
         
+        print(f"GUI 전송: 각도={angles}, 속도={speed}, 가속도={accel}")
+        print(f"메시지 데이터 크기: {len(msg.data)}")
+        print(f"메시지 데이터: {msg.data}")
+        
         self.angle_speed_pub.publish(msg)
         self.log_message(f"각도+속도+가속도 제어 전송: 각도={angles}, 속도={speed}, 가속도={accel}")
+        
+        # 연결 상태를 "전송 중"으로 표시
+        self.connection_label.config(text="연결 상태: 📤 전송 중...", foreground="blue")
     
     def send_coordinates(self):
         """기본 좌표 제어 메시지 전송"""
@@ -453,8 +470,15 @@ class RobotControlGUI(Node):
         msg = Float32MultiArray()
         msg.data = coords + [speed, accel]
         
+        print(f"GUI 전송: 좌표={coords}, 속도={speed}, 가속도={accel}")
+        print(f"메시지 데이터 크기: {len(msg.data)}")
+        print(f"메시지 데이터: {msg.data}")
+        
         self.coord_speed_pub.publish(msg)
         self.log_message(f"좌표+속도+가속도 제어 전송: 좌표={coords}, 속도={speed}, 가속도={accel}")
+        
+        # 연결 상태를 "전송 중"으로 표시
+        self.connection_label.config(text="연결 상태: 📤 전송 중...", foreground="blue")
     
     def apply_sync_settings(self):
         """동기화 설정 적용"""
@@ -519,6 +543,10 @@ class RobotControlGUI(Node):
     
     def servo_status_callback(self, msg):
         """서보 상태 피드백 수신"""
+        # 연결 상태 업데이트
+        self.last_message_time = time.time()
+        self.connection_status = "연결됨"
+        
         if len(msg.data) >= 18:  # 각 서보당 3개 값 (현재각도, 목표각도, 오차)
             self.update_status_display(msg.data)
             self.log_message(f"서보 상태 수신: {len(msg.data)}개 데이터")
@@ -597,6 +625,20 @@ class RobotControlGUI(Node):
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
         self.log_message("동기화 결과가 지워졌습니다.")
+    
+    def check_connection_status(self):
+        """연결 상태 확인"""
+        current_time = time.time()
+        time_since_last_message = current_time - self.last_message_time
+        
+        if time_since_last_message < 5.0:  # 5초 이내에 메시지 수신
+            if self.connection_status != "연결됨":
+                self.connection_status = "연결됨"
+                self.connection_label.config(text="연결 상태: ✅ 연결됨", foreground="green")
+        else:  # 5초 이상 메시지 없음
+            if self.connection_status != "연결 끊김":
+                self.connection_status = "연결 끊김"
+                self.connection_label.config(text="연결 상태: ❌ 연결 끊김", foreground="red")
     
     def ros_spin(self):
         """ROS2 스핀 (별도 스레드에서 실행)"""
