@@ -14,6 +14,7 @@ from tkinter import ttk, messagebox
 import math
 import threading
 import time
+import numpy as np
 
 class RobotControlGUI(Node):
     def __init__(self):
@@ -25,6 +26,9 @@ class RobotControlGUI(Node):
         self.angle_speed_pub = self.create_publisher(Float32MultiArray, 'servo_angles_with_speed', 10)
         self.coord_speed_pub = self.create_publisher(Float32MultiArray, 'robot_coords_with_speed', 10)
         self.sync_settings_pub = self.create_publisher(Float32MultiArray, 'sync_settings', 10)
+        
+        # 🚀 보간 전용 고속 모드 퍼블리셔 (ACK 없는 빠른 실행)
+        self.interpolation_fast_pub = self.create_publisher(Float32MultiArray, 'interpolation_fast_mode', 10)
         
         # ROS2 구독자 생성 (서보 상태 피드백)
         self.servo_status_sub = self.create_subscription(
@@ -74,6 +78,9 @@ class RobotControlGUI(Node):
         # 동기화 설정 탭
         self.setup_sync_settings_tab()
         
+        # 경로 제어 탭 (새로 추가)
+        self.setup_path_control_tab()
+        
         # 상태 모니터링 탭
         self.setup_status_monitoring_tab()
         
@@ -105,6 +112,10 @@ class RobotControlGUI(Node):
         # 연결 상태 변수 초기화
         self.last_message_time = time.time()
         self.connection_status = "대기 중..."
+        
+        # 경로 실행 상태 변수
+        self.path_executing = False
+        self.path_thread = None
         
         # 스타일 설정
         style.configure('Emergency.TButton', foreground='red', font=('Arial', 12, 'bold'))
@@ -451,8 +462,15 @@ class RobotControlGUI(Node):
         msg = Float32MultiArray()
         msg.data = coords
         
+        print(f"GUI 전송: 좌표={coords}")
+        print(f"메시지 데이터 크기: {len(msg.data)}")
+        print(f"메시지 데이터: {msg.data}")
+        
         self.coord_pub.publish(msg)
         self.log_message(f"좌표 제어 전송: {coords}")
+        
+        # 연결 상태를 "전송 중"으로 표시
+        self.connection_label.config(text="연결 상태: 📤 전송 중...", foreground="blue")
     
     def send_coordinates_with_speed(self):
         """속도/가속도 포함 좌표 제어 메시지 전송"""
@@ -503,6 +521,164 @@ class RobotControlGUI(Node):
             # 여기서는 로그만 출력
             self.log_message(f"서보 {i+1} 개별 설정: 속도={speed}, 가속도={accel}")
     
+    def setup_path_control_tab(self):
+        """경로 제어 탭 설정 (두 점 사이 보간 이동)"""
+        path_frame = ttk.Frame(self.notebook)
+        self.notebook.add(path_frame, text="경로 제어")
+        
+        # 시작점 설정
+        start_frame = ttk.LabelFrame(path_frame, text="시작점 좌표", padding="10")
+        start_frame.grid(row=0, column=0, padx=10, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        ttk.Label(start_frame, text="X (mm):").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        self.start_x_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(start_frame, textvariable=self.start_x_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(start_frame, text="Y (mm):").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        self.start_y_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(start_frame, textvariable=self.start_y_var, width=10).grid(row=1, column=1, padx=5, pady=2)
+        
+        ttk.Label(start_frame, text="Z (mm):").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
+        self.start_z_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(start_frame, textvariable=self.start_z_var, width=10).grid(row=2, column=1, padx=5, pady=2)
+        
+        ttk.Label(start_frame, text="Roll (도):").grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
+        self.start_roll_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(start_frame, textvariable=self.start_roll_var, width=10).grid(row=3, column=1, padx=5, pady=2)
+        
+        ttk.Label(start_frame, text="Pitch (도):").grid(row=4, column=0, padx=5, pady=2, sticky=tk.W)
+        self.start_pitch_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(start_frame, textvariable=self.start_pitch_var, width=10).grid(row=4, column=1, padx=5, pady=2)
+        
+        ttk.Label(start_frame, text="Yaw (도):").grid(row=5, column=0, padx=5, pady=2, sticky=tk.W)
+        self.start_yaw_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(start_frame, textvariable=self.start_yaw_var, width=10).grid(row=5, column=1, padx=5, pady=2)
+        
+        # 끝점 설정
+        end_frame = ttk.LabelFrame(path_frame, text="끝점 좌표", padding="10")
+        end_frame.grid(row=0, column=1, padx=10, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        ttk.Label(end_frame, text="X (mm):").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        self.end_x_var = tk.DoubleVar(value=100.0)
+        ttk.Entry(end_frame, textvariable=self.end_x_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(end_frame, text="Y (mm):").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        self.end_y_var = tk.DoubleVar(value=100.0)
+        ttk.Entry(end_frame, textvariable=self.end_y_var, width=10).grid(row=1, column=1, padx=5, pady=2)
+        
+        ttk.Label(end_frame, text="Z (mm):").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
+        self.end_z_var = tk.DoubleVar(value=100.0)
+        ttk.Entry(end_frame, textvariable=self.end_z_var, width=10).grid(row=2, column=1, padx=5, pady=2)
+        
+        ttk.Label(end_frame, text="Roll (도):").grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
+        self.end_roll_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(end_frame, textvariable=self.end_roll_var, width=10).grid(row=3, column=1, padx=5, pady=2)
+        
+        ttk.Label(end_frame, text="Pitch (도):").grid(row=4, column=0, padx=5, pady=2, sticky=tk.W)
+        self.end_pitch_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(end_frame, textvariable=self.end_pitch_var, width=10).grid(row=4, column=1, padx=5, pady=2)
+        
+        ttk.Label(end_frame, text="Yaw (도):").grid(row=5, column=0, padx=5, pady=2, sticky=tk.W)
+        self.end_yaw_var = tk.DoubleVar(value=0.0)
+        ttk.Entry(end_frame, textvariable=self.end_yaw_var, width=10).grid(row=5, column=1, padx=5, pady=2)
+        
+        # 경로 파라미터 설정
+        param_frame = ttk.LabelFrame(path_frame, text="경로 파라미터", padding="10")
+        param_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        ttk.Label(param_frame, text="보간 포인트 개수:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        self.interpolation_points_var = tk.IntVar(value=10)
+        ttk.Entry(param_frame, textvariable=self.interpolation_points_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Label(param_frame, text="개 (권장: 5-20)").grid(row=0, column=2, padx=5, pady=2)
+        
+        ttk.Label(param_frame, text="최소 전송 간격:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        self.path_interval_var = tk.DoubleVar(value=0.5)
+        ttk.Entry(param_frame, textvariable=self.path_interval_var, width=10).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Label(param_frame, text="초 (고속: 0.3초~)").grid(row=1, column=2, padx=5, pady=2)
+        
+        ttk.Label(param_frame, text="이동 속도:").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
+        self.path_speed_var = tk.DoubleVar(value=30.0)
+        ttk.Entry(param_frame, textvariable=self.path_speed_var, width=10).grid(row=2, column=1, padx=5, pady=2)
+        ttk.Label(param_frame, text="deg/s").grid(row=2, column=2, padx=5, pady=2)
+        
+        ttk.Label(param_frame, text="가속도:").grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
+        self.path_accel_var = tk.DoubleVar(value=20.0)
+        ttk.Entry(param_frame, textvariable=self.path_accel_var, width=10).grid(row=3, column=1, padx=5, pady=2)
+        ttk.Label(param_frame, text="deg/s²").grid(row=3, column=2, padx=5, pady=2)
+        
+        # 🚀 실행 모드 선택
+        ttk.Label(param_frame, text="실행 모드:").grid(row=4, column=0, padx=5, pady=2, sticky=tk.W)
+        self.fast_mode_var = tk.BooleanVar(value=True)
+        fast_mode_check = ttk.Checkbutton(
+            param_frame, 
+            text="고속 모드 (ACK 없음)", 
+            variable=self.fast_mode_var
+        )
+        fast_mode_check.grid(row=4, column=1, columnspan=2, padx=5, pady=2, sticky=tk.W)
+        
+        # 제어 버튼들
+        control_frame = ttk.Frame(path_frame)
+        control_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        
+        self.path_start_btn = ttk.Button(
+            control_frame, 
+            text="▶️ 경로 실행", 
+            command=self.start_path_execution
+        )
+        self.path_start_btn.grid(row=0, column=0, padx=5)
+        
+        self.path_stop_btn = ttk.Button(
+            control_frame, 
+            text="⏹️ 경로 정지", 
+            command=self.stop_path_execution,
+            state='disabled'
+        )
+        self.path_stop_btn.grid(row=0, column=1, padx=5)
+        
+        ttk.Button(
+            control_frame, 
+            text="↻ 왕복 실행", 
+            command=self.start_path_roundtrip
+        ).grid(row=0, column=2, padx=5)
+        
+        # 경로 상태 표시
+        self.path_status_label = ttk.Label(control_frame, text="경로 상태: 대기 중", foreground="gray")
+        self.path_status_label.grid(row=1, column=0, columnspan=3, pady=5)
+        
+        # 경로 프리셋
+        preset_frame = ttk.LabelFrame(path_frame, text="경로 프리셋", padding="10")
+        preset_frame.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        path_presets = [
+            ("수평 이동", [0, 0, 100, 0, 0, 0], [200, 0, 100, 0, 0, 0]),
+            ("수직 이동", [0, 0, 50, 0, 0, 0], [0, 0, 200, 0, 0, 0]),
+            ("대각선 이동", [0, 0, 0, 0, 0, 0], [150, 150, 150, 0, 0, 0]),
+            ("원호 이동", [100, 0, 100, 0, 0, 0], [100, 200, 100, 0, 0, 90])
+        ]
+        
+        for i, (name, start, end) in enumerate(path_presets):
+            ttk.Button(
+                preset_frame, 
+                text=name, 
+                command=lambda s=start, e=end: self.set_path_preset(s, e)
+            ).grid(row=i//2, column=i%2, padx=5, pady=2)
+        
+        # 📌 중요 안내 메시지
+        info_frame = ttk.LabelFrame(path_frame, text="⚠️ 중요 안내", padding="10")
+        info_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        info_text = (
+            "• 🚀 고속 모드 (권장): ACK 처리 없이 빠른 실행, 최소 간격 0.3초\n"
+            "• 🔄 일반 모드: 동기화 + ACK 처리, 안정적이지만 느림, 최소 간격 0.8초\n"
+            "• 전송 간격: IK 계산 시간 + 서보 이동 시간 고려\n"
+            "• 적절한 포인트 개수: 5-20개 (고속 모드는 더 많이 가능)\n"
+            "• 안전한 테스트: 고속 모드 + 5포인트 + 0.5초 간격부터 시작"
+        )
+        
+        info_label = ttk.Label(info_frame, text=info_text, foreground="darkblue", 
+                              font=('Arial', 9), justify=tk.LEFT)
+        info_label.grid(row=0, column=0, sticky=tk.W)
+    
     def set_preset_angles(self, angles):
         """프리셋 각도 설정"""
         for i, angle in enumerate(angles):
@@ -527,8 +703,266 @@ class RobotControlGUI(Node):
             self.pitch_speed_var.set(coords[4])
             self.yaw_speed_var.set(coords[5])
     
+    def set_path_preset(self, start_coords, end_coords):
+        """경로 프리셋 설정"""
+        self.start_x_var.set(start_coords[0])
+        self.start_y_var.set(start_coords[1])
+        self.start_z_var.set(start_coords[2])
+        self.start_roll_var.set(start_coords[3])
+        self.start_pitch_var.set(start_coords[4])
+        self.start_yaw_var.set(start_coords[5])
+        
+        self.end_x_var.set(end_coords[0])
+        self.end_y_var.set(end_coords[1])
+        self.end_z_var.set(end_coords[2])
+        self.end_roll_var.set(end_coords[3])
+        self.end_pitch_var.set(end_coords[4])
+        self.end_yaw_var.set(end_coords[5])
+        
+        self.log_message(f"경로 프리셋 설정: 시작={start_coords}, 끝={end_coords}")
+    
+    def interpolate_path(self, start, end, num_points):
+        """두 점 사이를 선형 보간하여 경로 생성"""
+        start_array = np.array(start)
+        end_array = np.array(end)
+        
+        # 선형 보간
+        path = []
+        for i in range(num_points):
+            t = i / (num_points - 1) if num_points > 1 else 0
+            point = start_array + t * (end_array - start_array)
+            path.append(point.tolist())
+        
+        return path
+    
+    def execute_path(self, path, interval, speed, accel, fast_mode=False):
+        """경로를 순차적으로 실행"""
+        self.path_executing = True
+        self.path_start_btn.config(state='disabled')
+        self.path_stop_btn.config(state='normal')
+        
+        total_points = len(path)
+        mode_name = "고속" if fast_mode else "일반"
+        
+        self.log_message(f"📍 {mode_name} 모드로 경로 실행 중...")
+        
+        for i, point in enumerate(path):
+            if not self.path_executing:
+                self.log_message("경로 실행이 중지되었습니다.")
+                break
+            
+            # 🚀 실행 모드에 따라 다른 토픽 사용
+            msg = Float32MultiArray()
+            
+            if fast_mode:
+                # 고속 모드: ACK 없는 빠른 실행
+                # 데이터: [x, y, z, roll, pitch, yaw, speed, accel]
+                msg.data = point + [speed, accel]
+                self.interpolation_fast_pub.publish(msg)
+                
+                # 고속 모드는 IK 계산 시간만 고려 (ACK 대기 없음)
+                wait_time = max(interval, 0.3)  # 최소 300ms (IK 계산만)
+                
+            else:
+                # 일반 모드: 동기화 + ACK 처리
+                msg.data = point + [speed, accel]
+                self.coord_speed_pub.publish(msg)
+                
+                # 일반 모드는 전체 처리 시간 고려
+                ik_processing_time = 0.5
+                
+                if i > 0:
+                    prev_point = path[i-1]
+                    max_coord_diff = max(abs(point[j] - prev_point[j]) for j in range(3))
+                    estimated_move_time = max_coord_diff / 100.0 if speed > 0 else 1.0
+                else:
+                    estimated_move_time = 1.0
+                
+                wait_time = max(interval, ik_processing_time + estimated_move_time + 0.2)
+            
+            # 상태 업데이트
+            progress = (i + 1) / total_points * 100
+            self.path_status_label.config(
+                text=f"경로 실행 중 ({mode_name}): {i+1}/{total_points} ({progress:.1f}%)", 
+                foreground="blue"
+            )
+            self.log_message(f"  포인트 {i+1}/{total_points}: {[round(p, 2) for p in point[:6]]}")
+            
+            # 다음 포인트까지 대기
+            time.sleep(wait_time)
+        
+        # 실행 완료
+        self.path_executing = False
+        self.path_start_btn.config(state='normal')
+        self.path_stop_btn.config(state='disabled')
+        self.path_status_label.config(text=f"경로 실행 완료! ({mode_name} 모드)", foreground="green")
+        self.log_message(f"✅ {mode_name} 모드 경로 실행이 완료되었습니다.")
+    
+    def start_path_execution(self):
+        """경로 실행 시작"""
+        if self.path_executing:
+            self.log_message("이미 경로가 실행 중입니다.")
+            return
+        
+        # 파라미터 가져오기
+        num_points = self.interpolation_points_var.get()
+        interval = self.path_interval_var.get()
+        speed = self.path_speed_var.get()
+        accel = self.path_accel_var.get()
+        fast_mode = self.fast_mode_var.get()
+        
+        # 🔧 안전성 검증 (모드에 따라 다른 최소값)
+        min_safe_interval = 0.3 if fast_mode else 0.8  # 고속 모드는 더 짧은 간격 허용
+        
+        if interval < min_safe_interval:
+            mode_text = "고속 모드" if fast_mode else "일반 모드"
+            warning_msg = (
+                f"⚠️ 경고: 전송 간격이 너무 짧습니다! ({mode_text})\n\n"
+                f"현재 설정: {interval}초\n"
+                f"권장 최소값: {min_safe_interval}초\n\n"
+                f"짧은 간격은 다음 문제를 일으킬 수 있습니다:\n"
+                f"- IK 계산 중 다음 명령 도착\n"
+                f"- 서보 이동 중 목표값 변경\n"
+                f"- 불안정한 동작\n\n"
+                f"계속 진행하시겠습니까?"
+            )
+            if not messagebox.askyesno("전송 간격 경고", warning_msg):
+                self.log_message("❌ 경로 실행이 취소되었습니다.")
+                return
+            self.log_message(f"⚠️ 경고: 짧은 간격({interval}초)으로 실행합니다.")
+        
+        if num_points > 50:
+            if not messagebox.askyesno("포인트 개수 확인", 
+                f"보간 포인트가 {num_points}개로 많습니다.\n"
+                f"예상 실행 시간: 약 {num_points * max(interval, min_safe_interval):.1f}초\n\n"
+                f"계속 진행하시겠습니까?"):
+                return
+        
+        # 시작점과 끝점 가져오기
+        start = [
+            self.start_x_var.get(),
+            self.start_y_var.get(),
+            self.start_z_var.get(),
+            self.start_roll_var.get(),
+            self.start_pitch_var.get(),
+            self.start_yaw_var.get()
+        ]
+        
+        end = [
+            self.end_x_var.get(),
+            self.end_y_var.get(),
+            self.end_z_var.get(),
+            self.end_roll_var.get(),
+            self.end_pitch_var.get(),
+            self.end_yaw_var.get()
+        ]
+        
+        # 경로 생성
+        path = self.interpolate_path(start, end, num_points)
+        
+        # 예상 실행 시간 계산
+        estimated_time = num_points * max(interval, min_safe_interval)
+        mode_text = "🚀 고속" if fast_mode else "🔄 일반"
+        
+        self.log_message(f"✅ 경로 실행 시작 ({mode_text} 모드):")
+        self.log_message(f"  - 포인트 개수: {num_points}개")
+        self.log_message(f"  - 최소 간격: {interval}초")
+        self.log_message(f"  - 예상 시간: 약 {estimated_time:.1f}초")
+        self.log_message(f"  - 속도: {speed} deg/s, 가속도: {accel} deg/s²")
+        if fast_mode:
+            self.log_message(f"  - ACK 처리: 비활성화 (빠른 실행)")
+        
+        # 별도 스레드에서 경로 실행
+        self.path_thread = threading.Thread(
+            target=self.execute_path, 
+            args=(path, interval, speed, accel, fast_mode),
+            daemon=True
+        )
+        self.path_thread.start()
+    
+    def stop_path_execution(self):
+        """경로 실행 정지"""
+        self.path_executing = False
+        self.path_status_label.config(text="경로 실행 정지됨", foreground="red")
+        self.log_message("경로 실행 정지 요청")
+    
+    def start_path_roundtrip(self):
+        """왕복 경로 실행"""
+        if self.path_executing:
+            self.log_message("이미 경로가 실행 중입니다.")
+            return
+        
+        # 파라미터 가져오기
+        num_points = self.interpolation_points_var.get()
+        interval = self.path_interval_var.get()
+        speed = self.path_speed_var.get()
+        accel = self.path_accel_var.get()
+        fast_mode = self.fast_mode_var.get()
+        
+        # 🔧 안전성 검증 (왕복은 2배 시간 소요)
+        min_safe_interval = 0.3 if fast_mode else 0.8
+        total_points = num_points * 2  # 왕복
+        
+        if interval < min_safe_interval:
+            warning_msg = (
+                f"⚠️ 경고: 전송 간격이 너무 짧습니다!\n\n"
+                f"현재 설정: {interval}초\n"
+                f"권장 최소값: {min_safe_interval}초\n"
+                f"총 포인트: {total_points}개 (왕복)\n"
+                f"예상 시간: 약 {total_points * max(interval, min_safe_interval):.1f}초\n\n"
+                f"계속 진행하시겠습니까?"
+            )
+            if not messagebox.askyesno("전송 간격 경고", warning_msg):
+                self.log_message("❌ 왕복 경로 실행이 취소되었습니다.")
+                return
+        
+        # 시작점과 끝점 가져오기
+        start = [
+            self.start_x_var.get(),
+            self.start_y_var.get(),
+            self.start_z_var.get(),
+            self.start_roll_var.get(),
+            self.start_pitch_var.get(),
+            self.start_yaw_var.get()
+        ]
+        
+        end = [
+            self.end_x_var.get(),
+            self.end_y_var.get(),
+            self.end_z_var.get(),
+            self.end_roll_var.get(),
+            self.end_pitch_var.get(),
+            self.end_yaw_var.get()
+        ]
+        
+        # 왕복 경로 생성 (시작->끝->시작)
+        forward_path = self.interpolate_path(start, end, num_points)
+        backward_path = self.interpolate_path(end, start, num_points)
+        full_path = forward_path + backward_path
+        
+        estimated_time = len(full_path) * max(interval, min_safe_interval)
+        mode_text = "🚀 고속" if fast_mode else "🔄 일반"
+        
+        self.log_message(f"✅ 왕복 경로 실행 시작 ({mode_text} 모드):")
+        self.log_message(f"  - 총 포인트: {len(full_path)}개 (편도 {num_points}개)")
+        self.log_message(f"  - 최소 간격: {interval}초")
+        self.log_message(f"  - 예상 시간: 약 {estimated_time:.1f}초")
+        if fast_mode:
+            self.log_message(f"  - ACK 처리: 비활성화 (빠른 실행)")
+        
+        # 별도 스레드에서 경로 실행
+        self.path_thread = threading.Thread(
+            target=self.execute_path, 
+            args=(full_path, interval, speed, accel, fast_mode),
+            daemon=True
+        )
+        self.path_thread.start()
+    
     def emergency_stop(self):
         """긴급 정지"""
+        # 경로 실행 중지
+        self.stop_path_execution()
+        
         # 모든 서보를 0도로 이동
         self.set_preset_angles([0, 0, 0, 0, 0, 0])
         self.send_angles()
