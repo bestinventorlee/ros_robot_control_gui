@@ -883,7 +883,19 @@ class RobotControlGUI(Node):
         #          end_x, end_y, end_z, end_roll, end_pitch, end_yaw,
         #          num_points, interval, speed, accel, fast_mode]
         msg.data = start_coords + end_coords + [num_points, interval, speed, accel, float(fast_mode)]
+        
+        # 디버그 출력
+        print(f"📤 경로 명령 전송:")
+        print(f"   시작점: {start_coords}")
+        print(f"   끝점: {end_coords}")
+        print(f"   파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
+        print(f"   총 데이터 크기: {len(msg.data)} (예상: 17)")
+        print(f"   데이터: {msg.data}")
+        
+        self.log_message(f"📤 path_command 메시지 전송: {len(msg.data)}개 데이터")
         self.path_command_pub.publish(msg)
+        
+        print(f"✅ 경로 명령 발행 완료")
     
     def path_execution_complete(self):
         """경로 실행 완료 처리"""
