@@ -30,6 +30,9 @@ class RobotControlGUI(Node):
         # 🚀 보간 전용 고속 모드 퍼블리셔 (ACK 없는 빠른 실행)
         self.interpolation_fast_pub = self.create_publisher(Float32MultiArray, 'interpolation_fast_mode', 10)
         
+        # 🎯 새로운 경로 명령 퍼블리셔 (두 점만 전송)
+        self.path_command_pub = self.create_publisher(Float32MultiArray, 'path_command', 10)
+        
         # ROS2 구독자 생성 (서보 상태 피드백)
         self.servo_status_sub = self.create_subscription(
             Float32MultiArray,
@@ -226,8 +229,13 @@ class RobotControlGUI(Node):
         self.yaw_var = tk.DoubleVar(value=0.0)
         ttk.Entry(basic_frame, textvariable=self.yaw_var, width=10).grid(row=5, column=1, padx=5, pady=2)
         
-        # 기본 좌표 제어 버튼
-        ttk.Button(basic_frame, text="좌표로 이동", command=self.send_coordinates).grid(row=6, column=0, columnspan=2, pady=10)
+        # 기본 좌표 제어 버튼 (메모리 절약을 위해 마스터에서 비활성화됨)
+        send_coord_btn = ttk.Button(basic_frame, text="좌표로 이동 (비활성화됨)", command=self.send_coordinates, state='disabled')
+        send_coord_btn.grid(row=6, column=0, columnspan=2, pady=10)
+        
+        # 안내 메시지
+        ttk.Label(basic_frame, text="⚠️ 속도/가속도 포함 좌표 제어를 사용하세요", 
+                  foreground="red", font=('Arial', 8)).grid(row=7, column=0, columnspan=2)
         
         # 속도/가속도 포함 좌표 제어
         speed_frame = ttk.LabelFrame(coord_frame, text="속도/가속도 포함 좌표 제어", padding="10")
@@ -592,9 +600,9 @@ class RobotControlGUI(Node):
         ttk.Label(param_frame, text="개 (권장: 5-20)").grid(row=0, column=2, padx=5, pady=2)
         
         ttk.Label(param_frame, text="최소 전송 간격:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        self.path_interval_var = tk.DoubleVar(value=0.5)
+        self.path_interval_var = tk.DoubleVar(value=0.05)  # 50ms (브로드캐스트 보간 최적값)
         ttk.Entry(param_frame, textvariable=self.path_interval_var, width=10).grid(row=1, column=1, padx=5, pady=2)
-        ttk.Label(param_frame, text="초 (고속: 0.3초~)").grid(row=1, column=2, padx=5, pady=2)
+        ttk.Label(param_frame, text="초 (보간: 0.01~0.2초, 권장: 0.05초)").grid(row=1, column=2, padx=5, pady=2)
         
         ttk.Label(param_frame, text="이동 속도:").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
         self.path_speed_var = tk.DoubleVar(value=30.0)
@@ -736,158 +744,147 @@ class RobotControlGUI(Node):
         return path
     
     def execute_path(self, path, interval, speed, accel, fast_mode=False):
-        """경로를 순차적으로 실행"""
+        """❌ 이 함수는 더 이상 사용되지 않습니다. 삭제 예정입니다."""
+        print("=" * 60)
+        print("⚠️ execute_path() 함수가 호출되었습니다!")
+        print("❌ 이 함수는 deprecated되었습니다!")
+        print("✅ start_path_execution()을 대신 사용하세요!")
+        print("=" * 60)
+        self.log_message("❌ 이전 방식의 경로 실행은 더 이상 지원되지 않습니다.")
+        self.log_message("✅ 마스터에서 보간 처리를 하도록 변경되었습니다.")
+        self.log_message("📌 경로 실행 버튼을 다시 클릭해주세요.")
+        
+        # 바로 종료
+        return
+    
+    def start_path_execution(self):
+        """경로 실행 시작 - 새로운 방식: 두 점만 마스터에 전송"""
+        print("=" * 60)
+        print("🚀 start_path_execution() 함수 호출됨!")
+        print("=" * 60)
+        print(f"현재 path_executing 상태: {self.path_executing}")
+        
+        if self.path_executing:
+            print("⚠️ 이미 경로가 실행 중입니다.")
+            self.log_message("이미 경로가 실행 중입니다.")
+            return
+        
+        # 파라미터 가져오기
+        num_points = self.interpolation_points_var.get()
+        interval = self.path_interval_var.get()
+        speed = self.path_speed_var.get()
+        accel = self.path_accel_var.get()
+        fast_mode = self.fast_mode_var.get()
+        
+        print(f"📋 파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
+        
+        # 🔧 안전성 검증
+        if num_points < 2 or num_points > 100:
+            print(f"❌ 보간 포인트 오류: {num_points}")
+            self.log_message("❌ 보간 포인트는 2-100개 사이여야 합니다.")
+            return
+        
+        if interval < 0.01 or interval > 2.0:
+            print(f"❌ 간격 오류: {interval}")
+            self.log_message("❌ 전송 간격은 0.01-2.0초 사이여야 합니다.")
+            return
+        
+        # 시작점과 끝점 가져오기
+        start = [
+            self.start_x_var.get(),
+            self.start_y_var.get(),
+            self.start_z_var.get(),
+            self.start_roll_var.get(),
+            self.start_pitch_var.get(),
+            self.start_yaw_var.get()
+        ]
+        
+        end = [
+            self.end_x_var.get(),
+            self.end_y_var.get(),
+            self.end_z_var.get(),
+            self.end_roll_var.get(),
+            self.end_pitch_var.get(),
+            self.end_yaw_var.get()
+        ]
+        
+        print(f"📍 시작점: {start}")
+        print(f"📍 끝점: {end}")
+        
+        # 🎯 새로운 방식: 두 점만 마스터에 전송
+        print("📤 send_path_command() 호출 중...")
+        self.send_path_command(start, end, num_points, interval, speed, accel, fast_mode)
+        print("✅ send_path_command() 호출 완료")
+        print("=" * 60)
+        
+        # GUI 상태 업데이트
         self.path_executing = True
         self.path_start_btn.config(state='disabled')
         self.path_stop_btn.config(state='normal')
         
-        total_points = len(path)
-        mode_name = "고속" if fast_mode else "일반"
+        # 예상 실행 시간 계산
+        estimated_time = num_points * interval
+        self.path_status_label.config(
+            text=f"경로 실행 중... (예상: {estimated_time:.1f}초)", 
+            foreground="blue"
+        )
         
-        self.log_message(f"📍 {mode_name} 모드로 경로 실행 중...")
+        mode_text = "🚀 고속" if fast_mode else "🔄 일반"
+        self.log_message(f"✅ 경로 명령 전송 ({mode_text} 모드):")
+        self.log_message(f"  - 시작점: {start}")
+        self.log_message(f"  - 끝점: {end}")
+        self.log_message(f"  - 보간 포인트: {num_points}개")
+        self.log_message(f"  - 전송 간격: {interval}초")
+        self.log_message(f"  - 예상 시간: {estimated_time:.1f}초")
+        self.log_message(f"  - 속도: {speed} deg/s, 가속도: {accel} deg/s²")
+        self.log_message("  - 마스터에서 보간 계산 및 실행 중...")
         
-        for i, point in enumerate(path):
-            if not self.path_executing:
-                self.log_message("경로 실행이 중지되었습니다.")
-                break
-            
-            # 🚀 실행 모드에 따라 다른 토픽 사용
-            msg = Float32MultiArray()
-            
-            if fast_mode:
-                # 고속 모드: ACK 없는 빠른 실행
-                # 데이터: [x, y, z, roll, pitch, yaw, speed, accel]
-                msg.data = point + [speed, accel]
-                self.interpolation_fast_pub.publish(msg)
-                
-                # 고속 모드는 IK 계산 시간만 고려 (ACK 대기 없음)
-                wait_time = max(interval, 0.3)  # 최소 300ms (IK 계산만)
-                
-            else:
-                # 일반 모드: 동기화 + ACK 처리
-                msg.data = point + [speed, accel]
-                self.coord_speed_pub.publish(msg)
-                
-                # 일반 모드는 전체 처리 시간 고려
-                ik_processing_time = 0.5
-                
-                if i > 0:
-                    prev_point = path[i-1]
-                    max_coord_diff = max(abs(point[j] - prev_point[j]) for j in range(3))
-                    estimated_move_time = max_coord_diff / 100.0 if speed > 0 else 1.0
-                else:
-                    estimated_move_time = 1.0
-                
-                wait_time = max(interval, ik_processing_time + estimated_move_time + 0.2)
-            
-            # 상태 업데이트
-            progress = (i + 1) / total_points * 100
-            self.path_status_label.config(
-                text=f"경로 실행 중 ({mode_name}): {i+1}/{total_points} ({progress:.1f}%)", 
-                foreground="blue"
-            )
-            self.log_message(f"  포인트 {i+1}/{total_points}: {[round(p, 2) for p in point[:6]]}")
-            
-            # 다음 포인트까지 대기
-            time.sleep(wait_time)
+        # 일정 시간 후 자동으로 완료 표시 (실제 완료는 마스터에서 처리됨)
+        estimated_ms = int(estimated_time * 1000)
+        self.root.after(estimated_ms + 500, self.path_execution_complete)
+    
+    def send_path_command(self, start_coords, end_coords, num_points, interval, speed, accel, fast_mode):
+        """두 점 사이 경로를 마스터에 위임"""
+        msg = Float32MultiArray()
+        # 데이터: [start_x, start_y, start_z, start_roll, start_pitch, start_yaw,
+        #          end_x, end_y, end_z, end_roll, end_pitch, end_yaw,
+        #          num_points, interval, speed, accel, fast_mode]
+        msg.data = start_coords + end_coords + [num_points, interval, speed, accel, float(fast_mode)]
         
-        # 실행 완료
+        # 디버그 출력
+        print(f"📤 경로 명령 전송:")
+        print(f"   시작점: {start_coords}")
+        print(f"   끝점: {end_coords}")
+        print(f"   파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
+        print(f"   총 데이터 크기: {len(msg.data)} (예상: 17)")
+        print(f"   데이터: {msg.data}")
+        
+        self.log_message(f"📤 path_command 메시지 전송: {len(msg.data)}개 데이터")
+        self.path_command_pub.publish(msg)
+        
+        print(f"✅ 경로 명령 발행 완료")
+    
+    def path_execution_complete(self):
+        """경로 실행 완료 처리"""
+        if not self.path_executing:
+            return  # 이미 정지됨
+        
         self.path_executing = False
         self.path_start_btn.config(state='normal')
         self.path_stop_btn.config(state='disabled')
-        self.path_status_label.config(text=f"경로 실행 완료! ({mode_name} 모드)", foreground="green")
-        self.log_message(f"✅ {mode_name} 모드 경로 실행이 완료되었습니다.")
-    
-    def start_path_execution(self):
-        """경로 실행 시작"""
-        if self.path_executing:
-            self.log_message("이미 경로가 실행 중입니다.")
-            return
-        
-        # 파라미터 가져오기
-        num_points = self.interpolation_points_var.get()
-        interval = self.path_interval_var.get()
-        speed = self.path_speed_var.get()
-        accel = self.path_accel_var.get()
-        fast_mode = self.fast_mode_var.get()
-        
-        # 🔧 안전성 검증 (모드에 따라 다른 최소값)
-        min_safe_interval = 0.3 if fast_mode else 0.8  # 고속 모드는 더 짧은 간격 허용
-        
-        if interval < min_safe_interval:
-            mode_text = "고속 모드" if fast_mode else "일반 모드"
-            warning_msg = (
-                f"⚠️ 경고: 전송 간격이 너무 짧습니다! ({mode_text})\n\n"
-                f"현재 설정: {interval}초\n"
-                f"권장 최소값: {min_safe_interval}초\n\n"
-                f"짧은 간격은 다음 문제를 일으킬 수 있습니다:\n"
-                f"- IK 계산 중 다음 명령 도착\n"
-                f"- 서보 이동 중 목표값 변경\n"
-                f"- 불안정한 동작\n\n"
-                f"계속 진행하시겠습니까?"
-            )
-            if not messagebox.askyesno("전송 간격 경고", warning_msg):
-                self.log_message("❌ 경로 실행이 취소되었습니다.")
-                return
-            self.log_message(f"⚠️ 경고: 짧은 간격({interval}초)으로 실행합니다.")
-        
-        if num_points > 50:
-            if not messagebox.askyesno("포인트 개수 확인", 
-                f"보간 포인트가 {num_points}개로 많습니다.\n"
-                f"예상 실행 시간: 약 {num_points * max(interval, min_safe_interval):.1f}초\n\n"
-                f"계속 진행하시겠습니까?"):
-                return
-        
-        # 시작점과 끝점 가져오기
-        start = [
-            self.start_x_var.get(),
-            self.start_y_var.get(),
-            self.start_z_var.get(),
-            self.start_roll_var.get(),
-            self.start_pitch_var.get(),
-            self.start_yaw_var.get()
-        ]
-        
-        end = [
-            self.end_x_var.get(),
-            self.end_y_var.get(),
-            self.end_z_var.get(),
-            self.end_roll_var.get(),
-            self.end_pitch_var.get(),
-            self.end_yaw_var.get()
-        ]
-        
-        # 경로 생성
-        path = self.interpolate_path(start, end, num_points)
-        
-        # 예상 실행 시간 계산
-        estimated_time = num_points * max(interval, min_safe_interval)
-        mode_text = "🚀 고속" if fast_mode else "🔄 일반"
-        
-        self.log_message(f"✅ 경로 실행 시작 ({mode_text} 모드):")
-        self.log_message(f"  - 포인트 개수: {num_points}개")
-        self.log_message(f"  - 최소 간격: {interval}초")
-        self.log_message(f"  - 예상 시간: 약 {estimated_time:.1f}초")
-        self.log_message(f"  - 속도: {speed} deg/s, 가속도: {accel} deg/s²")
-        if fast_mode:
-            self.log_message(f"  - ACK 처리: 비활성화 (빠른 실행)")
-        
-        # 별도 스레드에서 경로 실행
-        self.path_thread = threading.Thread(
-            target=self.execute_path, 
-            args=(path, interval, speed, accel, fast_mode),
-            daemon=True
-        )
-        self.path_thread.start()
+        self.path_status_label.config(text="경로 실행 완료!", foreground="green")
+        self.log_message("✅ 경로 실행이 완료되었습니다.")
     
     def stop_path_execution(self):
         """경로 실행 정지"""
         self.path_executing = False
+        self.path_start_btn.config(state='normal')
+        self.path_stop_btn.config(state='disabled')
         self.path_status_label.config(text="경로 실행 정지됨", foreground="red")
         self.log_message("경로 실행 정지 요청")
     
     def start_path_roundtrip(self):
-        """왕복 경로 실행"""
+        """왕복 경로 실행 - 새로운 방식: 마스터에서 처리"""
         if self.path_executing:
             self.log_message("이미 경로가 실행 중입니다.")
             return
@@ -899,22 +896,14 @@ class RobotControlGUI(Node):
         accel = self.path_accel_var.get()
         fast_mode = self.fast_mode_var.get()
         
-        # 🔧 안전성 검증 (왕복은 2배 시간 소요)
-        min_safe_interval = 0.3 if fast_mode else 0.8
-        total_points = num_points * 2  # 왕복
+        # 🔧 안전성 검증
+        if num_points < 2 or num_points > 100:
+            self.log_message("❌ 보간 포인트는 2-100개 사이여야 합니다.")
+            return
         
-        if interval < min_safe_interval:
-            warning_msg = (
-                f"⚠️ 경고: 전송 간격이 너무 짧습니다!\n\n"
-                f"현재 설정: {interval}초\n"
-                f"권장 최소값: {min_safe_interval}초\n"
-                f"총 포인트: {total_points}개 (왕복)\n"
-                f"예상 시간: 약 {total_points * max(interval, min_safe_interval):.1f}초\n\n"
-                f"계속 진행하시겠습니까?"
-            )
-            if not messagebox.askyesno("전송 간격 경고", warning_msg):
-                self.log_message("❌ 왕복 경로 실행이 취소되었습니다.")
-                return
+        if interval < 0.01 or interval > 2.0:
+            self.log_message("❌ 전송 간격은 0.01-2.0초 사이여야 합니다.")
+            return
         
         # 시작점과 끝점 가져오기
         start = [
@@ -935,28 +924,37 @@ class RobotControlGUI(Node):
             self.end_yaw_var.get()
         ]
         
-        # 왕복 경로 생성 (시작->끝->시작)
-        forward_path = self.interpolate_path(start, end, num_points)
-        backward_path = self.interpolate_path(end, start, num_points)
-        full_path = forward_path + backward_path
+        # 왕복 경로: 시작->끝 (첫 번째 경로)
+        self.send_path_command(start, end, num_points, interval, speed, accel, fast_mode)
         
-        estimated_time = len(full_path) * max(interval, min_safe_interval)
+        # GUI 상태 업데이트
+        self.path_executing = True
+        self.path_start_btn.config(state='disabled')
+        self.path_stop_btn.config(state='normal')
+        
+        # 예상 실행 시간 계산 (왕복은 2배)
+        estimated_time = num_points * interval * 2
+        self.path_status_label.config(
+            text=f"왕복 경로 실행 중... (예상: {estimated_time:.1f}초)", 
+            foreground="blue"
+        )
+        
         mode_text = "🚀 고속" if fast_mode else "🔄 일반"
         
-        self.log_message(f"✅ 왕복 경로 실행 시작 ({mode_text} 모드):")
-        self.log_message(f"  - 총 포인트: {len(full_path)}개 (편도 {num_points}개)")
-        self.log_message(f"  - 최소 간격: {interval}초")
-        self.log_message(f"  - 예상 시간: 약 {estimated_time:.1f}초")
-        if fast_mode:
-            self.log_message(f"  - ACK 처리: 비활성화 (빠른 실행)")
+        self.log_message(f"✅ 왕복 경로 시작 ({mode_text} 모드):")
+        self.log_message(f"  - 1차: 시작점 → 끝점 ({num_points}개 보간)")
+        self.log_message(f"  - 2차: 끝점 → 시작점 (자동, 마스터에서 처리)")
+        self.log_message(f"  - 총 보간 포인트: {num_points * 2}개")
+        self.log_message(f"  - 전송 간격: {interval}초")
+        self.log_message(f"  - 예상 시간: {estimated_time:.1f}초")
         
-        # 별도 스레드에서 경로 실행
-        self.path_thread = threading.Thread(
-            target=self.execute_path, 
-            args=(full_path, interval, speed, accel, fast_mode),
-            daemon=True
-        )
-        self.path_thread.start()
+        # TODO: 왕복 경로를 완전히 구현하려면 마스터에서 왕복 명령을 지원해야 함
+        # 현재는 첫 번째 경로만 전송됨
+        self.log_message("⚠️ 왕복 경로는 현재 첫 번째 경로만 실행됩니다.")
+        
+        # 일정 시간 후 자동으로 완료 표시
+        estimated_ms = int(estimated_time * 1000)
+        self.root.after(estimated_ms + 500, self.path_execution_complete)
     
     def emergency_stop(self):
         """긴급 정지"""
