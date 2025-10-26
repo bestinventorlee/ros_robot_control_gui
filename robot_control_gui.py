@@ -744,67 +744,18 @@ class RobotControlGUI(Node):
         return path
     
     def execute_path(self, path, interval, speed, accel, fast_mode=False):
-        """경로를 순차적으로 실행"""
-        self.path_executing = True
-        self.path_start_btn.config(state='disabled')
-        self.path_stop_btn.config(state='normal')
+        """❌ 이 함수는 더 이상 사용되지 않습니다. 삭제 예정입니다."""
+        print("=" * 60)
+        print("⚠️ execute_path() 함수가 호출되었습니다!")
+        print("❌ 이 함수는 deprecated되었습니다!")
+        print("✅ start_path_execution()을 대신 사용하세요!")
+        print("=" * 60)
+        self.log_message("❌ 이전 방식의 경로 실행은 더 이상 지원되지 않습니다.")
+        self.log_message("✅ 마스터에서 보간 처리를 하도록 변경되었습니다.")
+        self.log_message("📌 경로 실행 버튼을 다시 클릭해주세요.")
         
-        total_points = len(path)
-        mode_name = "고속" if fast_mode else "일반"
-        
-        self.log_message(f"📍 {mode_name} 모드로 경로 실행 중...")
-        
-        for i, point in enumerate(path):
-            if not self.path_executing:
-                self.log_message("경로 실행이 중지되었습니다.")
-                break
-            
-            # 🚀 실행 모드에 따라 다른 토픽 사용
-            msg = Float32MultiArray()
-            
-            if fast_mode:
-                # 고속 모드: ACK 없는 빠른 실행
-                # 데이터: [x, y, z, roll, pitch, yaw, speed, accel]
-                msg.data = point + [speed, accel]
-                self.interpolation_fast_pub.publish(msg)
-                
-                # 고속 모드는 IK 계산 시간만 고려 (ACK 대기 없음)
-                wait_time = max(interval, 0.01)  # 최소 10ms (브로드캐스트 보간 최적화)
-                
-            else:
-                # 일반 모드: 동기화 + ACK 처리
-                msg.data = point + [speed, accel]
-                self.coord_speed_pub.publish(msg)
-                
-                # 일반 모드는 전체 처리 시간 고려
-                ik_processing_time = 0.5
-                
-                if i > 0:
-                    prev_point = path[i-1]
-                    max_coord_diff = max(abs(point[j] - prev_point[j]) for j in range(3))
-                    estimated_move_time = max_coord_diff / 100.0 if speed > 0 else 1.0
-                else:
-                    estimated_move_time = 1.0
-                
-                wait_time = max(interval, ik_processing_time + estimated_move_time + 0.2)
-            
-            # 상태 업데이트
-            progress = (i + 1) / total_points * 100
-            self.path_status_label.config(
-                text=f"경로 실행 중 ({mode_name}): {i+1}/{total_points} ({progress:.1f}%)", 
-                foreground="blue"
-            )
-            self.log_message(f"  포인트 {i+1}/{total_points}: {[round(p, 2) for p in point[:6]]}")
-            
-            # 다음 포인트까지 대기
-            time.sleep(wait_time)
-        
-        # 실행 완료
-        self.path_executing = False
-        self.path_start_btn.config(state='normal')
-        self.path_stop_btn.config(state='disabled')
-        self.path_status_label.config(text=f"경로 실행 완료! ({mode_name} 모드)", foreground="green")
-        self.log_message(f"✅ {mode_name} 모드 경로 실행이 완료되었습니다.")
+        # 바로 종료
+        return
     
     def start_path_execution(self):
         """경로 실행 시작 - 새로운 방식: 두 점만 마스터에 전송"""
