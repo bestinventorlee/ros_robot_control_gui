@@ -808,7 +808,13 @@ class RobotControlGUI(Node):
     
     def start_path_execution(self):
         """경로 실행 시작 - 새로운 방식: 두 점만 마스터에 전송"""
+        print("=" * 60)
+        print("🚀 start_path_execution() 함수 호출됨!")
+        print("=" * 60)
+        print(f"현재 path_executing 상태: {self.path_executing}")
+        
         if self.path_executing:
+            print("⚠️ 이미 경로가 실행 중입니다.")
             self.log_message("이미 경로가 실행 중입니다.")
             return
         
@@ -819,12 +825,16 @@ class RobotControlGUI(Node):
         accel = self.path_accel_var.get()
         fast_mode = self.fast_mode_var.get()
         
+        print(f"📋 파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
+        
         # 🔧 안전성 검증
         if num_points < 2 or num_points > 100:
+            print(f"❌ 보간 포인트 오류: {num_points}")
             self.log_message("❌ 보간 포인트는 2-100개 사이여야 합니다.")
             return
         
         if interval < 0.01 or interval > 2.0:
+            print(f"❌ 간격 오류: {interval}")
             self.log_message("❌ 전송 간격은 0.01-2.0초 사이여야 합니다.")
             return
         
@@ -847,8 +857,14 @@ class RobotControlGUI(Node):
             self.end_yaw_var.get()
         ]
         
+        print(f"📍 시작점: {start}")
+        print(f"📍 끝점: {end}")
+        
         # 🎯 새로운 방식: 두 점만 마스터에 전송
+        print("📤 send_path_command() 호출 중...")
         self.send_path_command(start, end, num_points, interval, speed, accel, fast_mode)
+        print("✅ send_path_command() 호출 완료")
+        print("=" * 60)
         
         # GUI 상태 업데이트
         self.path_executing = True
