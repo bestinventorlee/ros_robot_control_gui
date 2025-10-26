@@ -759,6 +759,13 @@ class RobotControlGUI(Node):
     
     def start_path_execution(self):
         """경로 실행 시작 - 새로운 방식: 두 점만 마스터에 전송"""
+        import sys
+        sys.stdout.write("=" * 60 + "\n")
+        sys.stdout.write("🚀 start_path_execution() 함수 호출됨!\n")
+        sys.stdout.write("=" * 60 + "\n")
+        sys.stdout.write(f"현재 path_executing 상태: {self.path_executing}\n")
+        sys.stdout.flush()
+        
         print("=" * 60)
         print("🚀 start_path_execution() 함수 호출됨!")
         print("=" * 60)
@@ -852,17 +859,29 @@ class RobotControlGUI(Node):
         msg.data = start_coords + end_coords + [num_points, interval, speed, accel, float(fast_mode)]
         
         # 디버그 출력
-        print(f"📤 경로 명령 전송:")
-        print(f"   시작점: {start_coords}")
-        print(f"   끝점: {end_coords}")
-        print(f"   파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
-        print(f"   총 데이터 크기: {len(msg.data)} (예상: 17)")
-        print(f"   데이터: {msg.data}")
+        import sys
+        sys.stdout.write("=" * 80 + "\n")
+        sys.stdout.write("📤 [GUI → 마스터] 경로 명령 전송\n")
+        sys.stdout.write("=" * 80 + "\n")
+        sys.stdout.flush()
+        
+        print("=" * 80)
+        print("📤 [GUI → 마스터] 경로 명령 전송")
+        print("=" * 80)
+        print(f"시작점: {start_coords}")
+        print(f"끝점: {end_coords}")
+        print(f"파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
+        print(f"총 데이터 크기: {len(msg.data)} (예상: 17)")
+        print("\n전체 데이터 배열:")
+        for i, val in enumerate(msg.data):
+            print(f"  [{i:2d}] = {val:10.2f}")
+        print("=" * 80)
         
         self.log_message(f"📤 path_command 메시지 전송: {len(msg.data)}개 데이터")
         self.path_command_pub.publish(msg)
         
-        print(f"✅ 경로 명령 발행 완료")
+        print("✅ 경로 명령 발행 완료")
+        print("=" * 80)
     
     def path_execution_complete(self):
         """경로 실행 완료 처리"""
