@@ -600,7 +600,7 @@ class RobotControlGUI(Node):
         ttk.Label(param_frame, text="개 (권장: 5-20)").grid(row=0, column=2, padx=5, pady=2)
         
         ttk.Label(param_frame, text="최소 전송 간격:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        self.path_interval_var = tk.DoubleVar(value=0.05)  # 50ms (브로드캐스트 보간 최적값)
+        self.path_interval_var = tk.DoubleVar(value=0.05)  # 50ms (중간 속도 보간)
         ttk.Entry(param_frame, textvariable=self.path_interval_var, width=10).grid(row=1, column=1, padx=5, pady=2)
         ttk.Label(param_frame, text="초 (보간: 0.01~0.2초, 권장: 0.05초)").grid(row=1, column=2, padx=5, pady=2)
         
@@ -783,7 +783,9 @@ class RobotControlGUI(Node):
         accel = self.path_accel_var.get()
         fast_mode = self.fast_mode_var.get()
         
+        # ✅ 값 검증 및 디버그 출력
         print(f"📋 파라미터: num_points={num_points}, interval={interval}, speed={speed}, accel={accel}, fast_mode={fast_mode}")
+        print(f"📋 interval 상세: 타입={type(interval)}, 값={interval}, 변수값={self.path_interval_var.get()}")
         
         # 🔧 안전성 검증
         if num_points < 2 or num_points > 100:
@@ -791,10 +793,15 @@ class RobotControlGUI(Node):
             self.log_message("❌ 보간 포인트는 2-100개 사이여야 합니다.")
             return
         
-        if interval < 0.01 or interval > 2.0:
-            print(f"❌ 간격 오류: {interval}")
-            self.log_message("❌ 전송 간격은 0.01-2.0초 사이여야 합니다.")
-            return
+        # ✅ interval 값 검증 및 보정
+        if interval < 0.01:
+            print(f"⚠️ interval 값이 너무 작음 ({interval}), 0.01로 보정")
+            interval = 0.01
+        if interval > 2.0:
+            print(f"⚠️ interval 값이 너무 큼 ({interval}), 2.0으로 보정")
+            interval = 2.0
+        
+        # ✅ 검증 완료 - 보정된 interval 사용
         
         # 시작점과 끝점 가져오기
         start = [
