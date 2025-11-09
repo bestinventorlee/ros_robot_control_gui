@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-6축 로봇 제어 GUI
+6축 로봇 통합 제어 GUI
 - 각도/좌표 + 속도/가속도 제어
 - ROS2 통신을 통한 ESP32 마스터 컨트롤러와 연동
+- IK(역기구학) 계산 및 웨이포인트 기반 경로 계획
 """
 
 import rclpy
@@ -10,15 +11,185 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import Pose, Point, Quaternion
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import math
 import threading
 import time
 import numpy as np
+from scipy.optimize import least_squares
+import json
+import os
+from datetime import datetime
+import matplotlib
+matplotlib.use('TkAgg')  # Tkinter와 호환되는 백엔드 사용
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+class CobotKinematics:
+    """6축 협동로봇 운동학 클래스"""
+    def __init__(self):
+        # DH 파라미터
+        self.a = [0, 0.2805, 0.2495, 0, 0, 0]  # 링크 길이 (m)
+        self.alpha = [-np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0]  # 링크 비틀림 (rad)
+        self.d = [0.235, 0, 0, 0.258, 0.180, 0.123]  # 조인트 오프셋 (m)
+        self.n_joints = 6
+        
+        # 조인트 오프셋 정의
+        self.joint_offsets = [-np.pi/2, -np.pi/2, 0, np.pi/2, np.pi/2, 0]
+        
+        # 조인트 회전 방향
+        self.joint_direction = [1, 1, -1, 1, 1, 1]
+        
+        # 조인트 동작 범위
+        self.joint_limits = np.array([[-135, 135]] * self.n_joints)
+        
+    def _apply_joint_offset(self, user_angles):
+        """사용자 입력 각도에 오프셋 적용"""
+        adjusted_angles = np.array(user_angles) * np.array(self.joint_direction)
+        return adjusted_angles + np.array(self.joint_offsets)
+    
+    def _remove_joint_offset(self, dh_angles):
+        """DH 각도에서 오프셋 제거"""
+        adjusted_angles = np.array(dh_angles) - np.array(self.joint_offsets)
+        return adjusted_angles * np.array(self.joint_direction)
+    
+    def dh_transform(self, a, alpha, d, theta):
+        """DH 변환 행렬"""
+        ct = np.cos(theta)
+        st = np.sin(theta)
+        ca = np.cos(alpha)
+        sa = np.sin(alpha)
+        
+        T = np.array([
+            [ct, -st*ca, st*sa, a*ct],
+            [st, ct*ca, -ct*sa, a*st],
+            [0, sa, ca, d],
+            [0, 0, 0, 1]
+        ])
+        return T
+    
+    def forward_kinematics(self, user_joint_angles):
+        """순방향 운동학"""
+        dh_angles = self._apply_joint_offset(user_joint_angles)
+        T = np.eye(4)
+        
+        for i in range(self.n_joints):
+            T_i = self.dh_transform(self.a[i], self.alpha[i], self.d[i], dh_angles[i])
+            T = T @ T_i
+        
+        position = T[:3, 3]
+        rotation_matrix = T[:3, :3]
+        euler_angles = self.rotation_matrix_to_euler(rotation_matrix)
+        
+        return position, euler_angles, T
+    
+    def rotation_matrix_to_euler(self, R):
+        """회전 행렬을 오일러 각도로 변환"""
+        sy = np.sqrt(R[0,0] * R[0,0] + R[1,0] * R[1,0])
+        
+        singular = sy < 1e-6
+        
+        if not singular:
+            x = np.arctan2(R[2,1], R[2,2])
+            y = np.arctan2(-R[2,0], sy)
+            z = np.arctan2(R[1,0], R[0,0])
+        else:
+            x = np.arctan2(-R[1,2], R[1,1])
+            y = np.arctan2(-R[2,0], sy)
+            z = 0
+        
+        return np.array([x, y, z])
+    
+    def euler_to_rotation_matrix(self, euler_angles):
+        """오일러 각도를 회전 행렬로 변환"""
+        rx, ry, rz = euler_angles
+        
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx), -np.sin(rx)],
+            [0, np.sin(rx), np.cos(rx)]
+        ])
+        
+        Ry = np.array([
+            [np.cos(ry), 0, np.sin(ry)],
+            [0, 1, 0],
+            [-np.sin(ry), 0, np.cos(ry)]
+        ])
+        
+        Rz = np.array([
+            [np.cos(rz), -np.sin(rz), 0],
+            [np.sin(rz), np.cos(rz), 0],
+            [0, 0, 1]
+        ])
+        
+        return Rz @ Ry @ Rx
+    
+    def inverse_kinematics(self, target_position, target_orientation, initial_guess=None):
+        """역방향 운동학"""
+        if initial_guess is None:
+            initial_guess = np.zeros(self.n_joints)
+        
+        # 초기값을 조인트 범위 내로 클리핑
+        initial_guess_deg = np.degrees(initial_guess)
+        initial_guess_deg = np.clip(initial_guess_deg, 
+                                   self.joint_limits[:, 0], 
+                                   self.joint_limits[:, 1])
+        initial_guess = np.radians(initial_guess_deg)
+        
+        def objective_function(user_joint_angles):
+            pos, euler, _ = self.forward_kinematics(user_joint_angles)
+            
+            # 위치 오차
+            pos_error = target_position - pos
+            
+            # 방향 오차
+            orient_error = target_orientation - euler
+            
+            # 전체 오차 (위치 오차에 더 큰 가중치)
+            error = np.concatenate([pos_error * 1000, orient_error])
+            return error
+        
+        # 조인트 범위를 라디안으로 변환
+        lower_bounds = np.radians(self.joint_limits[:, 0])
+        upper_bounds = np.radians(self.joint_limits[:, 1])
+        
+        try:
+            result = least_squares(objective_function, initial_guess, 
+                                 bounds=(lower_bounds, upper_bounds),
+                                 method='trf',
+                                 ftol=1e-6, xtol=1e-6, max_nfev=1000)
+            
+            solution = result.x
+            
+            # 해의 유효성 검증
+            pos, euler, _ = self.forward_kinematics(solution)
+            pos_error = np.linalg.norm(target_position - pos)
+            orient_error = np.linalg.norm(target_orientation - euler)
+            
+            if pos_error < 0.001 and orient_error < 0.01:
+                return solution, True
+            else:
+                return solution, False
+        except:
+            return initial_guess, False
+
 
 class RobotControlGUI(Node):
     def __init__(self):
         super().__init__('robot_control_gui')
+        
+        # 🤖 운동학 객체 생성
+        self.robot = CobotKinematics()
+        
+        # 📊 현재 각도 (초기값)
+        self.current_angles = np.zeros(6)
+        
+        # 📍 웨이포인트 경로 데이터
+        self.waypoints = []  # [(x,y,z,rx,ry,rz), ...]
+        self.interpolated_points = []
+        self.angle_trajectory = []
         
         # ROS2 퍼블리셔 생성
         self.angle_pub = self.create_publisher(Float32MultiArray, 'servo_angles', 10)
@@ -52,7 +223,7 @@ class RobotControlGUI(Node):
         # 연결 상태 모니터링 타이머
         self.connection_timer = self.create_timer(1.0, self.check_connection_status)
         
-        self.get_logger().info('로봇 제어 GUI가 시작되었습니다.')
+        self.get_logger().info('🤖 로봇 통합 제어 GUI가 시작되었습니다.')
     
     def setup_gui(self):
         """GUI 설정"""
@@ -81,8 +252,11 @@ class RobotControlGUI(Node):
         # 동기화 설정 탭
         self.setup_sync_settings_tab()
         
-        # 경로 제어 탭 (새로 추가)
+        # 경로 제어 탭 (두 점 보간)
         self.setup_path_control_tab()
+        
+        # 🎯 웨이포인트 경로 계획 탭 (다중 경로점 + IK)
+        self.setup_waypoint_planning_tab()
         
         # 상태 모니터링 탭
         self.setup_status_monitoring_tab()
@@ -1097,6 +1271,884 @@ class RobotControlGUI(Node):
             if self.connection_status != "연결 끊김":
                 self.connection_status = "연결 끊김"
                 self.connection_label.config(text="연결 상태: ❌ 연결 끊김", foreground="red")
+    
+    def setup_waypoint_planning_tab(self):
+        """웨이포인트 기반 경로 계획 탭 설정"""
+        waypoint_frame = ttk.Frame(self.notebook)
+        self.notebook.add(waypoint_frame, text="🎯 웨이포인트 경로")
+        
+        # 좌표 입력 섹션
+        coord_input_frame = ttk.LabelFrame(waypoint_frame, text="경로점 입력", padding="10")
+        coord_input_frame.grid(row=0, column=0, padx=10, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # X, Y, Z 입력
+        ttk.Label(coord_input_frame, text="X (m):").grid(row=0, column=0, sticky=tk.W)
+        self.wp_x_entry = ttk.Entry(coord_input_frame, width=10)
+        self.wp_x_entry.grid(row=0, column=1, padx=5)
+        self.wp_x_entry.insert(0, "0.3")
+        
+        ttk.Label(coord_input_frame, text="Y (m):").grid(row=0, column=2, sticky=tk.W, padx=(10,0))
+        self.wp_y_entry = ttk.Entry(coord_input_frame, width=10)
+        self.wp_y_entry.grid(row=0, column=3, padx=5)
+        self.wp_y_entry.insert(0, "0.0")
+        
+        ttk.Label(coord_input_frame, text="Z (m):").grid(row=0, column=4, sticky=tk.W, padx=(10,0))
+        self.wp_z_entry = ttk.Entry(coord_input_frame, width=10)
+        self.wp_z_entry.grid(row=0, column=5, padx=5)
+        self.wp_z_entry.insert(0, "0.5")
+        
+        # Roll, Pitch, Yaw 입력
+        ttk.Label(coord_input_frame, text="Roll (deg):").grid(row=1, column=0, sticky=tk.W, pady=(5,0))
+        self.wp_rx_entry = ttk.Entry(coord_input_frame, width=10)
+        self.wp_rx_entry.grid(row=1, column=1, padx=5, pady=(5,0))
+        self.wp_rx_entry.insert(0, "0")
+        
+        ttk.Label(coord_input_frame, text="Pitch (deg):").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=(5,0))
+        self.wp_ry_entry = ttk.Entry(coord_input_frame, width=10)
+        self.wp_ry_entry.grid(row=1, column=3, padx=5, pady=(5,0))
+        self.wp_ry_entry.insert(0, "0")
+        
+        ttk.Label(coord_input_frame, text="Yaw (deg):").grid(row=1, column=4, sticky=tk.W, padx=(10,0), pady=(5,0))
+        self.wp_rz_entry = ttk.Entry(coord_input_frame, width=10)
+        self.wp_rz_entry.grid(row=1, column=5, padx=5, pady=(5,0))
+        self.wp_rz_entry.insert(0, "0")
+        
+        # 버튼들
+        ttk.Button(coord_input_frame, text="경로점 추가", command=self.add_waypoint).grid(
+            row=2, column=0, columnspan=2, pady=(10,0), sticky=tk.W+tk.E)
+        ttk.Button(coord_input_frame, text="현재 위치", command=self.get_current_position).grid(
+            row=2, column=2, columnspan=2, pady=(10,0), padx=(5,0), sticky=tk.W+tk.E)
+        ttk.Button(coord_input_frame, text="Home 위치", command=self.goto_home_position).grid(
+            row=2, column=4, columnspan=2, pady=(10,0), padx=(5,0), sticky=tk.W+tk.E)
+        
+        # 경로점 목록
+        waypoint_list_frame = ttk.LabelFrame(waypoint_frame, text="경로점 목록", padding="10")
+        waypoint_list_frame.grid(row=0, column=1, padx=10, pady=5, sticky=(tk.W, tk.E, tk.N, tk.S), rowspan=2)
+        
+        scrollbar = ttk.Scrollbar(waypoint_list_frame, orient=tk.VERTICAL)
+        self.waypoint_listbox = tk.Listbox(waypoint_list_frame, height=12, width=40, yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.waypoint_listbox.yview)
+        
+        self.waypoint_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # 목록 관리 버튼
+        btn_frame = ttk.Frame(waypoint_list_frame)
+        btn_frame.grid(row=1, column=0, columnspan=2, pady=(5,0))
+        
+        ttk.Button(btn_frame, text="선택 삭제", command=self.delete_waypoint).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="전체 삭제", command=self.clear_waypoints).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="위로", command=self.move_waypoint_up).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="아래로", command=self.move_waypoint_down).pack(side=tk.LEFT, padx=2)
+        
+        # 💾 저장/불러오기 버튼
+        save_load_frame = ttk.Frame(waypoint_list_frame)
+        save_load_frame.grid(row=2, column=0, columnspan=2, pady=(5,0))
+        
+        ttk.Button(save_load_frame, text="💾 경로 저장", command=self.save_waypoints).pack(side=tk.LEFT, padx=2)
+        ttk.Button(save_load_frame, text="📂 경로 불러오기", command=self.load_waypoints).pack(side=tk.LEFT, padx=2)
+        
+        # 제어 파라미터
+        param_frame = ttk.LabelFrame(waypoint_frame, text="경로 파라미터", padding="10")
+        param_frame.grid(row=1, column=0, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        # 보간 간격
+        ttk.Label(param_frame, text="보간 간격 (m):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.wp_interpolation_step = ttk.Entry(param_frame, width=15)
+        self.wp_interpolation_step.grid(row=0, column=1, padx=5, pady=5)
+        self.wp_interpolation_step.insert(0, "0.01")
+        
+        # 속도
+        ttk.Label(param_frame, text="속도 (deg/s):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.wp_speed_entry = ttk.Entry(param_frame, width=15)
+        self.wp_speed_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.wp_speed_entry.insert(0, "50")
+        
+        # 가속도
+        ttk.Label(param_frame, text="가속도 (deg/s²):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.wp_accel_entry = ttk.Entry(param_frame, width=15)
+        self.wp_accel_entry.grid(row=2, column=1, padx=5, pady=5)
+        self.wp_accel_entry.insert(0, "30")
+        
+        # 딜레이
+        ttk.Label(param_frame, text="포인트간 딜레이 (ms):").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.wp_delay_entry = ttk.Entry(param_frame, width=15)
+        self.wp_delay_entry.grid(row=3, column=1, padx=5, pady=5)
+        self.wp_delay_entry.insert(0, "50")
+        
+        # 경로 타입 선택
+        ttk.Label(param_frame, text="경로 타입:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.path_type_var = tk.StringVar(value="linear")
+        path_type_combo = ttk.Combobox(param_frame, textvariable=self.path_type_var, width=13, state='readonly')
+        path_type_combo['values'] = ('linear', 'circular', 'bezier')
+        path_type_combo.grid(row=4, column=1, padx=5, pady=5)
+        
+        # 실행 버튼
+        exec_frame = ttk.Frame(waypoint_frame)
+        exec_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        
+        ttk.Button(exec_frame, text="📐 경로 생성 (보간 + IK)", 
+                  command=self.generate_trajectory, width=25).pack(side=tk.LEFT, padx=5)
+        ttk.Button(exec_frame, text="🎨 3D 시각화", 
+                  command=self.visualize_3d_path, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(exec_frame, text="▶️ 경로 실행", 
+                  command=self.execute_waypoint_trajectory, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(exec_frame, text="⏹️ 정지", 
+                  command=self.stop_waypoint_execution, width=12).pack(side=tk.LEFT, padx=5)
+        
+        # 📊 진행 상황 프로그레스바
+        progress_frame = ttk.Frame(waypoint_frame)
+        progress_frame.grid(row=3, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
+        
+        self.wp_progress = ttk.Progressbar(progress_frame, length=400, mode='determinate')
+        self.wp_progress.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        
+        # 상태 표시
+        self.wp_status_label = ttk.Label(progress_frame, text="상태: 대기 중", foreground="gray")
+        self.wp_status_label.pack(side=tk.LEFT, padx=10)
+        
+        # 📊 경로 통계 정보
+        stats_frame = ttk.LabelFrame(waypoint_frame, text="경로 통계", padding="10")
+        stats_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        self.stats_text = tk.Text(stats_frame, height=4, width=60, state=tk.DISABLED)
+        self.stats_text.pack(fill=tk.BOTH, expand=True)
+    
+    def add_waypoint(self):
+        """경로점 추가"""
+        try:
+            x = float(self.wp_x_entry.get())
+            y = float(self.wp_y_entry.get())
+            z = float(self.wp_z_entry.get())
+            rx = float(self.wp_rx_entry.get())
+            ry = float(self.wp_ry_entry.get())
+            rz = float(self.wp_rz_entry.get())
+            
+            waypoint = (x, y, z, rx, ry, rz)
+            self.waypoints.append(waypoint)
+            
+            self.waypoint_listbox.insert(tk.END, 
+                f"P{len(self.waypoints)}: ({x:.3f}, {y:.3f}, {z:.3f}), ({rx:.1f}°, {ry:.1f}°, {rz:.1f}°)")
+            
+            self.log_message(f"경로점 추가: {waypoint}")
+            
+        except ValueError:
+            messagebox.showerror("입력 오류", "올바른 숫자를 입력하세요.")
+    
+    def delete_waypoint(self):
+        """선택된 경로점 삭제"""
+        selection = self.waypoint_listbox.curselection()
+        if selection:
+            idx = selection[0]
+            self.waypoints.pop(idx)
+            self.waypoint_listbox.delete(idx)
+            # 번호 재정렬
+            self.refresh_waypoint_list()
+            self.log_message(f"경로점 {idx+1} 삭제됨")
+    
+    def clear_waypoints(self):
+        """모든 경로점 삭제"""
+        self.waypoints.clear()
+        self.waypoint_listbox.delete(0, tk.END)
+        self.log_message("모든 경로점 삭제됨")
+    
+    def move_waypoint_up(self):
+        """선택된 경로점을 위로 이동"""
+        selection = self.waypoint_listbox.curselection()
+        if selection and selection[0] > 0:
+            idx = selection[0]
+            self.waypoints[idx], self.waypoints[idx-1] = self.waypoints[idx-1], self.waypoints[idx]
+            self.refresh_waypoint_list()
+            self.waypoint_listbox.selection_set(idx-1)
+    
+    def move_waypoint_down(self):
+        """선택된 경로점을 아래로 이동"""
+        selection = self.waypoint_listbox.curselection()
+        if selection and selection[0] < len(self.waypoints) - 1:
+            idx = selection[0]
+            self.waypoints[idx], self.waypoints[idx+1] = self.waypoints[idx+1], self.waypoints[idx]
+            self.refresh_waypoint_list()
+            self.waypoint_listbox.selection_set(idx+1)
+    
+    def refresh_waypoint_list(self):
+        """경로점 목록 새로고침"""
+        self.waypoint_listbox.delete(0, tk.END)
+        for i, (x, y, z, rx, ry, rz) in enumerate(self.waypoints):
+            self.waypoint_listbox.insert(tk.END, 
+                f"P{i+1}: ({x:.3f}, {y:.3f}, {z:.3f}), ({rx:.1f}°, {ry:.1f}°, {rz:.1f}°)")
+    
+    def get_current_position(self):
+        """현재 위치 가져오기 (FK 사용)"""
+        pos, orient, _ = self.robot.forward_kinematics(self.current_angles)
+        
+        self.wp_x_entry.delete(0, tk.END)
+        self.wp_x_entry.insert(0, f"{pos[0]:.3f}")
+        
+        self.wp_y_entry.delete(0, tk.END)
+        self.wp_y_entry.insert(0, f"{pos[1]:.3f}")
+        
+        self.wp_z_entry.delete(0, tk.END)
+        self.wp_z_entry.insert(0, f"{pos[2]:.3f}")
+        
+        self.wp_rx_entry.delete(0, tk.END)
+        self.wp_rx_entry.insert(0, f"{np.degrees(orient[0]):.1f}")
+        
+        self.wp_ry_entry.delete(0, tk.END)
+        self.wp_ry_entry.insert(0, f"{np.degrees(orient[1]):.1f}")
+        
+        self.wp_rz_entry.delete(0, tk.END)
+        self.wp_rz_entry.insert(0, f"{np.degrees(orient[2]):.1f}")
+        
+        self.log_message(f"현재 위치: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+    
+    def goto_home_position(self):
+        """Home 위치로 설정"""
+        pos, orient, _ = self.robot.forward_kinematics(np.zeros(6))
+        
+        self.wp_x_entry.delete(0, tk.END)
+        self.wp_x_entry.insert(0, f"{pos[0]:.3f}")
+        
+        self.wp_y_entry.delete(0, tk.END)
+        self.wp_y_entry.insert(0, f"{pos[1]:.3f}")
+        
+        self.wp_z_entry.delete(0, tk.END)
+        self.wp_z_entry.insert(0, f"{pos[2]:.3f}")
+        
+        self.wp_rx_entry.delete(0, tk.END)
+        self.wp_rx_entry.insert(0, f"{np.degrees(orient[0]):.1f}")
+        
+        self.wp_ry_entry.delete(0, tk.END)
+        self.wp_ry_entry.insert(0, f"{np.degrees(orient[1]):.1f}")
+        
+        self.wp_rz_entry.delete(0, tk.END)
+        self.wp_rz_entry.insert(0, f"{np.degrees(orient[2]):.1f}")
+        
+        self.log_message("Home 위치로 설정됨")
+    
+    def generate_trajectory(self):
+        """경로 생성 (보간 + IK)"""
+        if len(self.waypoints) < 1:
+            messagebox.showwarning("경고", "최소 1개의 경로점이 필요합니다.")
+            return
+        
+        try:
+            interp_step = float(self.wp_interpolation_step.get())
+        except ValueError:
+            messagebox.showerror("오류", "올바른 보간 간격을 입력하세요.")
+            return
+        
+        # 프로그레스바 초기화
+        self.wp_progress['value'] = 0
+        self.wp_progress['maximum'] = 100
+        
+        self.wp_status_label.config(text="상태: 경로 생성 중...", foreground="blue")
+        self.log_message("="*50)
+        self.log_message("📐 경로 생성 시작...")
+        
+        # 경로 타입 확인
+        path_type = self.path_type_var.get()
+        self.log_message(f"   - 경로 타입: {path_type}")
+        self.log_message(f"   - 보간 간격: {interp_step} m")
+        
+        # 현재 위치를 시작점으로
+        current_pos, current_orient, _ = self.robot.forward_kinematics(self.current_angles)
+        
+        # 모든 경로점을 좌표+자세 배열로 변환
+        all_points = []
+        
+        # 현재 위치 추가
+        all_points.append([current_pos[0], current_pos[1], current_pos[2], 
+                          current_orient[0], current_orient[1], current_orient[2]])
+        
+        # 웨이포인트 추가
+        for waypoint in self.waypoints:
+            x, y, z, rx_deg, ry_deg, rz_deg = waypoint
+            all_points.append([x, y, z, 
+                             np.radians(rx_deg), 
+                             np.radians(ry_deg), 
+                             np.radians(rz_deg)])
+        
+        # 프로그레스바 업데이트: 보간 생성 (0-30%)
+        self.wp_progress['value'] = 10
+        self.root.update_idletasks()
+        
+        # 경로 타입에 따른 보간
+        if path_type == "circular" and len(all_points) >= 3:
+            self.log_message("   - 원호 보간 사용")
+            self.interpolated_points = self.interpolate_circular(all_points)
+        elif path_type == "bezier" and len(all_points) >= 3:
+            self.log_message("   - 베지어 보간 사용")
+            self.interpolated_points = self.interpolate_bezier(all_points)
+        else:
+            self.log_message("   - 직선 보간 사용")
+            self.interpolated_points = self.interpolate_linear(all_points)
+        
+        self.wp_progress['value'] = 30
+        self.root.update_idletasks()
+        
+        self.log_message(f"✅ 보간점 생성 완료: {len(self.interpolated_points)}개")
+        
+        # IK 계산
+        self.angle_trajectory = []
+        prev_angles = self.current_angles.copy()
+        
+        success_count = 0
+        total_points = len(self.interpolated_points)
+        
+        for i, point in enumerate(self.interpolated_points):
+            pos = point[:3]
+            orient = point[3:]
+            
+            # IK 수행
+            angles, success = self.robot.inverse_kinematics(pos, orient, prev_angles)
+            
+            if success:
+                success_count += 1
+            
+            self.angle_trajectory.append(np.degrees(angles))
+            prev_angles = angles
+            
+            # 프로그레스바 업데이트: IK 계산 (30-100%)
+            progress = 30 + int((i + 1) / total_points * 70)
+            self.wp_progress['value'] = progress
+            
+            # 10개마다 GUI 업데이트
+            if i % 10 == 0:
+                self.wp_status_label.config(
+                    text=f"상태: IK 계산 중... ({i+1}/{total_points})", 
+                    foreground="blue"
+                )
+                self.root.update_idletasks()
+        
+        # 완료
+        self.wp_progress['value'] = 100
+        
+        success_rate = (success_count / total_points * 100) if total_points > 0 else 0
+        self.log_message(f"✅ IK 계산 완료: {success_count}/{total_points} ({success_rate:.1f}%)")
+        self.log_message(f"📊 총 각도 궤적 포인트: {len(self.angle_trajectory)}개")
+        self.log_message("="*50)
+        self.log_message("✅ 경로 생성 완료!")
+        
+        # 통계 정보 업데이트
+        self.update_path_statistics()
+        
+        self.wp_status_label.config(
+            text=f"상태: 생성 완료 ({len(self.angle_trajectory)}개, {success_rate:.0f}% 성공)", 
+            foreground="green"
+        )
+    
+    def execute_waypoint_trajectory(self):
+        """웨이포인트 경로 실행"""
+        if len(self.angle_trajectory) == 0:
+            messagebox.showwarning("경고", "먼저 경로를 생성하세요.")
+            return
+        
+        # 별도 스레드에서 실행
+        self.path_executing = True
+        self.path_thread = threading.Thread(target=self._execute_waypoint_trajectory_thread, daemon=True)
+        self.path_thread.start()
+    
+    def _execute_waypoint_trajectory_thread(self):
+        """웨이포인트 경로 실행 스레드"""
+        try:
+            speed = float(self.wp_speed_entry.get())
+            accel = float(self.wp_accel_entry.get())
+            delay_ms = float(self.wp_delay_entry.get())
+        except ValueError:
+            self.log_message("✗ 제어 파라미터 오류")
+            self.path_executing = False
+            return
+        
+        # 프로그레스바 초기화
+        self.wp_progress['value'] = 0
+        self.wp_progress['maximum'] = len(self.angle_trajectory)
+        
+        self.log_message("="*50)
+        self.log_message("▶️ 웨이포인트 경로 실행 시작...")
+        self.log_message(f"총 포인트: {len(self.angle_trajectory)}개")
+        self.log_message(f"속도: {speed} deg/s, 가속도: {accel} deg/s²")
+        self.log_message(f"딜레이: {delay_ms} ms")
+        
+        start_time = time.time()
+        
+        for i, angles in enumerate(self.angle_trajectory):
+            if not self.path_executing:
+                self.log_message("⚠ 실행 중단됨")
+                break
+            
+            # ROS로 전송
+            self.angle_speed_pub.publish(Float32MultiArray(data=list(angles) + [speed, accel]))
+            
+            # 현재 각도 업데이트
+            self.current_angles = np.radians(angles)
+            
+            # 프로그레스바 업데이트
+            self.wp_progress['value'] = i + 1
+            
+            # 진행 상황 업데이트
+            progress = (i+1) / len(self.angle_trajectory) * 100
+            elapsed = time.time() - start_time
+            remaining = (elapsed / (i+1)) * (len(self.angle_trajectory) - i - 1)
+            
+            self.wp_status_label.config(
+                text=f"상태: 실행 중... ({i+1}/{len(self.angle_trajectory)}, {progress:.0f}%, 남은시간: {remaining:.1f}초)", 
+                foreground="blue"
+            )
+            
+            if i % 10 == 0 or i == len(self.angle_trajectory) - 1:
+                self.log_message(f"진행: {i+1}/{len(self.angle_trajectory)} ({progress:.1f}%)")
+            
+            # 딜레이
+            time.sleep(delay_ms / 1000.0)
+        
+        self.path_executing = False
+        total_time = time.time() - start_time
+        self.log_message(f"✅ 웨이포인트 경로 실행 완료! (총 {total_time:.1f}초)")
+        self.wp_status_label.config(text="상태: 실행 완료", foreground="green")
+        self.wp_progress['value'] = len(self.angle_trajectory)
+    
+    def stop_waypoint_execution(self):
+        """웨이포인트 경로 실행 정지"""
+        if self.path_executing:
+            self.path_executing = False
+            self.log_message("⏹️ 실행 정지 요청됨...")
+            self.wp_status_label.config(text="상태: 정지됨", foreground="red")
+        else:
+            self.log_message("실행 중이 아닙니다.")
+    
+    def save_waypoints(self):
+        """💾 웨이포인트 경로 저장"""
+        if len(self.waypoints) == 0:
+            messagebox.showwarning("경고", "저장할 경로점이 없습니다.")
+            return
+        
+        # 기본 파일명 생성
+        default_filename = f"waypoints_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        # 파일 저장 대화상자
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=default_filename,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        # 저장할 데이터 구성
+        data = {
+            "version": "2.0",
+            "timestamp": datetime.now().isoformat(),
+            "waypoints": self.waypoints,
+            "parameters": {
+                "interpolation_step": self.wp_interpolation_step.get(),
+                "speed": self.wp_speed_entry.get(),
+                "accel": self.wp_accel_entry.get(),
+                "delay": self.wp_delay_entry.get(),
+                "path_type": self.path_type_var.get()
+            },
+            "current_angles": self.current_angles.tolist()
+        }
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            self.log_message(f"✅ 경로 저장 완료: {os.path.basename(filename)}")
+            self.log_message(f"   - 경로점: {len(self.waypoints)}개")
+            messagebox.showinfo("저장 완료", f"경로가 저장되었습니다:\n{filename}")
+        except Exception as e:
+            self.log_message(f"❌ 경로 저장 실패: {str(e)}")
+            messagebox.showerror("저장 실패", f"경로 저장 중 오류 발생:\n{str(e)}")
+    
+    def load_waypoints(self):
+        """📂 웨이포인트 경로 불러오기"""
+        filename = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # 버전 확인
+            version = data.get("version", "1.0")
+            
+            # 경로점 불러오기
+            loaded_waypoints = data.get("waypoints", [])
+            if not loaded_waypoints:
+                messagebox.showwarning("경고", "경로점이 없는 파일입니다.")
+                return
+            
+            # 기존 경로점 삭제 확인
+            if self.waypoints:
+                if not messagebox.askyesno("확인", "기존 경로점을 삭제하고 불러오시겠습니까?"):
+                    return
+            
+            # 경로점 적용
+            self.waypoints.clear()
+            for wp in loaded_waypoints:
+                # 튜플로 변환
+                if isinstance(wp, list):
+                    self.waypoints.append(tuple(wp))
+                else:
+                    self.waypoints.append(wp)
+            
+            self.refresh_waypoint_list()
+            
+            # 파라미터 불러오기 (있으면)
+            if "parameters" in data:
+                params = data["parameters"]
+                
+                self.wp_interpolation_step.delete(0, tk.END)
+                self.wp_interpolation_step.insert(0, params.get("interpolation_step", "0.01"))
+                
+                self.wp_speed_entry.delete(0, tk.END)
+                self.wp_speed_entry.insert(0, params.get("speed", "50"))
+                
+                self.wp_accel_entry.delete(0, tk.END)
+                self.wp_accel_entry.insert(0, params.get("accel", "30"))
+                
+                self.wp_delay_entry.delete(0, tk.END)
+                self.wp_delay_entry.insert(0, params.get("delay", "50"))
+                
+                if "path_type" in params:
+                    self.path_type_var.set(params["path_type"])
+            
+            self.log_message(f"✅ 경로 불러오기 완료: {os.path.basename(filename)}")
+            self.log_message(f"   - 경로점: {len(self.waypoints)}개")
+            self.log_message(f"   - 버전: {version}")
+            messagebox.showinfo("불러오기 완료", f"경로가 불러와졌습니다:\n{len(self.waypoints)}개 경로점")
+            
+        except json.JSONDecodeError:
+            self.log_message("❌ 경로 불러오기 실패: 잘못된 JSON 형식")
+            messagebox.showerror("불러오기 실패", "잘못된 파일 형식입니다.")
+        except Exception as e:
+            self.log_message(f"❌ 경로 불러오기 실패: {str(e)}")
+            messagebox.showerror("불러오기 실패", f"경로 불러오기 중 오류 발생:\n{str(e)}")
+    
+    def interpolate_circular(self, points):
+        """원호 보간"""
+        if len(points) < 3:
+            return self.interpolate_linear(points)
+        
+        interpolated = []
+        
+        for i in range(len(points) - 2):
+            p0 = np.array(points[i][:3])
+            p1 = np.array(points[i+1][:3])
+            p2 = np.array(points[i+2][:3])
+            
+            # 3점을 지나는 원호 생성 (단순화된 버전)
+            # 중간점을 통한 2차 베지어 곡선으로 근사
+            steps = 10
+            for t in np.linspace(0, 1, steps):
+                # Quadratic Bezier
+                pos = (1-t)**2 * p0 + 2*(1-t)*t * p1 + t**2 * p2
+                
+                # 자세는 선형 보간
+                orient0 = np.array(points[i][3:])
+                orient2 = np.array(points[i+2][3:])
+                orient = (1-t) * orient0 + t * orient2
+                
+                interpolated.append(np.concatenate([pos, orient]))
+        
+        return interpolated
+    
+    def interpolate_linear(self, points):
+        """직선 보간"""
+        try:
+            interp_step = float(self.wp_interpolation_step.get())
+        except ValueError:
+            interp_step = 0.01
+        
+        interpolated = []
+        
+        for i in range(len(points) - 1):
+            start = np.array(points[i])
+            end = np.array(points[i+1])
+            
+            distance = np.linalg.norm(end[:3] - start[:3])
+            num_steps = max(int(distance / interp_step), 1)
+            
+            for j in range(num_steps + 1):
+                t = j / num_steps
+                point = (1 - t) * start + t * end
+                interpolated.append(point)
+        
+        return interpolated
+    
+    def interpolate_bezier(self, points):
+        """베지어 곡선 보간"""
+        if len(points) < 3:
+            return self.interpolate_linear(points)
+        
+        try:
+            interp_step = float(self.wp_interpolation_step.get())
+        except ValueError:
+            interp_step = 0.01
+        
+        interpolated = []
+        
+        # 3차 베지어 곡선 (Cubic Bezier)
+        for i in range(len(points) - 1):
+            p0 = np.array(points[i])
+            p3 = np.array(points[i+1])
+            
+            # 제어점 생성 (1/3, 2/3 지점)
+            p1 = p0 + (p3 - p0) / 3
+            p2 = p0 + (p3 - p0) * 2 / 3
+            
+            # 거리 기반 세그먼트 수 계산
+            distance = np.linalg.norm(p3[:3] - p0[:3])
+            num_steps = max(int(distance / interp_step), 1)
+            
+            for j in range(num_steps + 1):
+                t = j / num_steps
+                # Cubic Bezier formula
+                point = (1-t)**3 * p0 + 3*(1-t)**2*t * p1 + 3*(1-t)*t**2 * p2 + t**3 * p3
+                interpolated.append(point)
+        
+        return interpolated
+    
+    def update_path_statistics(self):
+        """경로 통계 정보 업데이트"""
+        if not hasattr(self, 'stats_text'):
+            return
+        
+        self.stats_text.config(state=tk.NORMAL)
+        self.stats_text.delete(1.0, tk.END)
+        
+        stats = []
+        stats.append(f"📍 경로점 개수: {len(self.waypoints)}개")
+        stats.append(f"📐 보간점 개수: {len(self.interpolated_points)}개")
+        stats.append(f"🎯 각도 궤적: {len(self.angle_trajectory)}개")
+        
+        if len(self.waypoints) >= 2:
+            # 총 경로 길이 계산
+            total_distance = 0
+            for i in range(len(self.waypoints) - 1):
+                p1 = np.array(self.waypoints[i][:3])
+                p2 = np.array(self.waypoints[i+1][:3])
+                total_distance += np.linalg.norm(p2 - p1)
+            stats.append(f"📏 총 경로 길이: {total_distance:.3f} m")
+            
+            # 예상 실행 시간
+            if self.angle_trajectory:
+                try:
+                    delay_ms = float(self.wp_delay_entry.get())
+                    estimated_time = len(self.angle_trajectory) * delay_ms / 1000.0
+                    stats.append(f"⏱️ 예상 시간: {estimated_time:.1f}초")
+                except:
+                    pass
+        
+        self.stats_text.insert(tk.END, "\n".join(stats))
+        self.stats_text.config(state=tk.DISABLED)
+    
+    def visualize_3d_path(self):
+        """🎨 3D 경로 시각화"""
+        if len(self.waypoints) == 0:
+            messagebox.showwarning("경고", "시각화할 경로점이 없습니다.")
+            return
+        
+        self.log_message("="*50)
+        self.log_message("🎨 3D 경로 시각화 생성 중...")
+        
+        # 새 창 생성
+        viz_window = tk.Toplevel(self.root)
+        viz_window.title("🎨 3D 경로 시각화")
+        viz_window.geometry("900x700")
+        
+        # Figure 생성
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # 현재 위치
+        current_pos, _, _ = self.robot.forward_kinematics(self.current_angles)
+        
+        # 경로점 추출
+        waypoint_positions = []
+        for wp in self.waypoints:
+            waypoint_positions.append([wp[0], wp[1], wp[2]])
+        waypoint_positions = np.array(waypoint_positions)
+        
+        # 1. 현재 위치 표시 (큰 별)
+        ax.scatter([current_pos[0]], [current_pos[1]], [current_pos[2]], 
+                  c='green', marker='*', s=500, label='현재 위치', 
+                  edgecolors='darkgreen', linewidths=2)
+        
+        # 2. 경로점 표시 (빨간 점)
+        ax.scatter(waypoint_positions[:, 0], 
+                  waypoint_positions[:, 1], 
+                  waypoint_positions[:, 2],
+                  c='red', marker='o', s=100, label='경로점',
+                  edgecolors='darkred', linewidths=1.5)
+        
+        # 경로점 번호 표시
+        for i, wp in enumerate(waypoint_positions):
+            ax.text(wp[0], wp[1], wp[2], f'  P{i+1}', 
+                   fontsize=10, color='darkred', weight='bold')
+        
+        # 3. 경로점 연결선 (파란 선)
+        all_points = np.vstack([[current_pos[0], current_pos[1], current_pos[2]], 
+                                waypoint_positions])
+        ax.plot(all_points[:, 0], all_points[:, 1], all_points[:, 2],
+               'b-', linewidth=2, alpha=0.6, label='경로점 연결')
+        
+        # 4. 보간점 표시 (있으면)
+        if len(self.interpolated_points) > 0:
+            interp_positions = np.array([p[:3] for p in self.interpolated_points])
+            ax.plot(interp_positions[:, 0], 
+                   interp_positions[:, 1], 
+                   interp_positions[:, 2],
+                   'c-', linewidth=1, alpha=0.8, label=f'보간 경로 ({len(self.interpolated_points)}개)')
+            
+            # 보간점 표시 (작은 점, 10개마다)
+            step = max(len(self.interpolated_points) // 20, 1)
+            sample_points = interp_positions[::step]
+            ax.scatter(sample_points[:, 0], 
+                      sample_points[:, 1], 
+                      sample_points[:, 2],
+                      c='cyan', marker='.', s=20, alpha=0.5)
+        
+        # 5. 작업 공간 표시 (반투명 박스)
+        # 로봇의 대략적인 작업 공간
+        workspace_limits = {
+            'x': [0.1, 0.6],
+            'y': [-0.4, 0.4],
+            'z': [0.0, 0.8]
+        }
+        
+        # 작업 공간 경계 박스 그리기
+        from itertools import product
+        corners = list(product([workspace_limits['x'][0], workspace_limits['x'][1]],
+                              [workspace_limits['y'][0], workspace_limits['y'][1]],
+                              [workspace_limits['z'][0], workspace_limits['z'][1]]))
+        
+        # 박스의 12개 엣지 그리기
+        edges = [
+            [corners[0], corners[1]], [corners[2], corners[3]],
+            [corners[4], corners[5]], [corners[6], corners[7]],
+            [corners[0], corners[2]], [corners[1], corners[3]],
+            [corners[4], corners[6]], [corners[5], corners[7]],
+            [corners[0], corners[4]], [corners[1], corners[5]],
+            [corners[2], corners[6]], [corners[3], corners[7]]
+        ]
+        
+        for edge in edges:
+            points = np.array(edge)
+            ax.plot(points[:, 0], points[:, 1], points[:, 2],
+                   'gray', linestyle='--', linewidth=0.5, alpha=0.3)
+        
+        # 6. 축 설정
+        ax.set_xlabel('X (m)', fontsize=10, weight='bold')
+        ax.set_ylabel('Y (m)', fontsize=10, weight='bold')
+        ax.set_zlabel('Z (m)', fontsize=10, weight='bold')
+        
+        # 7. 제목 및 범례
+        path_type = self.path_type_var.get()
+        title = f'3D 경로 시각화 - {path_type.upper()} 보간\n'
+        title += f'경로점: {len(self.waypoints)}개'
+        if len(self.interpolated_points) > 0:
+            title += f' | 보간점: {len(self.interpolated_points)}개'
+        if len(self.angle_trajectory) > 0:
+            title += f' | 각도 궤적: {len(self.angle_trajectory)}개'
+        
+        ax.set_title(title, fontsize=12, weight='bold', pad=20)
+        ax.legend(loc='upper left', fontsize=9)
+        
+        # 8. 그리드 및 배경
+        ax.grid(True, alpha=0.3)
+        ax.set_facecolor('#f0f0f0')
+        
+        # 9. 축 범위 자동 조정 (약간 여유 있게)
+        if len(all_points) > 0:
+            margin = 0.1
+            ax.set_xlim(all_points[:, 0].min() - margin, all_points[:, 0].max() + margin)
+            ax.set_ylim(all_points[:, 1].min() - margin, all_points[:, 1].max() + margin)
+            ax.set_zlim(max(0, all_points[:, 2].min() - margin), all_points[:, 2].max() + margin)
+        
+        # 10. 동일한 스케일 (선택적)
+        # ax.set_box_aspect([1,1,1])  # 정육면체 비율
+        
+        # Canvas에 Figure 추가
+        canvas = FigureCanvasTkAgg(fig, master=viz_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # 툴바 추가 (확대, 회전 등)
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        toolbar = NavigationToolbar2Tk(canvas, viz_window)
+        toolbar.update()
+        
+        # 정보 패널
+        info_frame = ttk.Frame(viz_window)
+        info_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        info_text = f"💡 팁: 마우스로 드래그하여 회전, 휠로 확대/축소 가능"
+        ttk.Label(info_frame, text=info_text, foreground="blue").pack()
+        
+        # 통계 정보
+        stats_frame = ttk.Frame(viz_window)
+        stats_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        stats = []
+        stats.append(f"📍 경로점: {len(self.waypoints)}개")
+        if len(self.interpolated_points) > 0:
+            stats.append(f"📐 보간점: {len(self.interpolated_points)}개")
+        if len(self.angle_trajectory) > 0:
+            stats.append(f"🎯 각도 궤적: {len(self.angle_trajectory)}개")
+        
+        # 총 경로 길이
+        if len(self.waypoints) >= 1:
+            total_distance = np.linalg.norm(current_pos - waypoint_positions[0])
+            for i in range(len(waypoint_positions) - 1):
+                total_distance += np.linalg.norm(waypoint_positions[i+1] - waypoint_positions[i])
+            stats.append(f"📏 총 경로 길이: {total_distance:.3f} m")
+        
+        stats_text = " | ".join(stats)
+        ttk.Label(stats_frame, text=stats_text, font=('Arial', 9)).pack()
+        
+        # 버튼 프레임
+        button_frame = ttk.Frame(viz_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        def save_plot():
+            """플롯 이미지 저장"""
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".png",
+                initialfile=f"path_visualization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                filetypes=[("PNG files", "*.png"), ("PDF files", "*.pdf"), ("All files", "*.*")]
+            )
+            if filename:
+                fig.savefig(filename, dpi=300, bbox_inches='tight')
+                self.log_message(f"✅ 시각화 이미지 저장: {os.path.basename(filename)}")
+                messagebox.showinfo("저장 완료", f"이미지가 저장되었습니다:\n{filename}")
+        
+        def reset_view():
+            """뷰 리셋"""
+            ax.view_init(elev=20, azim=45)
+            canvas.draw()
+        
+        ttk.Button(button_frame, text="💾 이미지 저장", command=save_plot).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="🔄 뷰 리셋", command=reset_view).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="❌ 닫기", command=viz_window.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        # 로그 메시지
+        self.log_message("✅ 3D 시각화 생성 완료")
+        self.log_message(f"   - 경로점: {len(self.waypoints)}개")
+        if len(self.interpolated_points) > 0:
+            self.log_message(f"   - 보간점: {len(self.interpolated_points)}개")
+        self.log_message("="*50)
+    
+    def visualize_3d_path_embedded(self):
+        """🎨 3D 경로 시각화 (GUI 내장형 - 선택사항)"""
+        # 이 메서드는 GUI 내에 직접 임베드하는 버전입니다.
+        # 필요시 사용 가능
+        pass
     
     def ros_spin(self):
         """ROS2 스핀 (별도 스레드에서 실행)"""
