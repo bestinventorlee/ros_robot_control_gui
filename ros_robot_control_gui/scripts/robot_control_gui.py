@@ -75,15 +75,21 @@ class CobotKinematics:
         dh_angles = self._apply_joint_offset(user_joint_angles)
         T = np.eye(4)
         
+        # 각 조인트 위치를 저장할 리스트
+        joint_positions = [np.array([0, 0, 0])]  # 베이스 위치
+        
         for i in range(self.n_joints):
             T_i = self.dh_transform(self.a[i], self.alpha[i], self.d[i], dh_angles[i])
             T = T @ T_i
+            
+            # 현재 조인트 위치 저장
+            joint_positions.append(T[:3, 3].copy())
         
         position = T[:3, 3]
         rotation_matrix = T[:3, :3]
         euler_angles = self.rotation_matrix_to_euler(rotation_matrix)
         
-        return position, euler_angles, T
+        return position, euler_angles, T, joint_positions
     
     def rotation_matrix_to_euler(self, R):
         """회전 행렬을 오일러 각도로 변환"""
@@ -126,6 +132,55 @@ class CobotKinematics:
         
         return Rz @ Ry @ Rx
     
+    def draw_coordinate_frame(self, ax, origin, rotation_matrix, scale=0.1, label="", alpha=0.8):
+        """좌표계를 화살표로 그리기"""
+        # X축: 빨강, Y축: 초록, Z축: 파랑
+        colors = ['r', 'g', 'b']
+        labels = ['X', 'Y', 'Z']
+        
+        for i in range(3):
+            # 회전 행렬의 각 열이 해당 축의 방향
+            direction = rotation_matrix[:, i] * scale
+            ax.quiver(origin[0], origin[1], origin[2],
+                     direction[0], direction[1], direction[2],
+                     color=colors[i], arrow_length_ratio=0.3, linewidth=2,
+                     alpha=alpha)
+            
+            # 축 레이블 표시
+            end_point = origin + direction * 1.2
+            ax.text(end_point[0], end_point[1], end_point[2], 
+                   f"{label}{labels[i]}", color=colors[i], fontsize=8, fontweight='bold')
+    
+    def plot_robot(self, user_joint_angles, ax, show_frames=True, alpha=0.6):
+        """로봇 구조 시각화"""
+        # 조인트 위치 계산
+        _, _, T, joint_positions = self.forward_kinematics(user_joint_angles)
+        joint_positions = np.array(joint_positions)
+        
+        # 로봇 링크 그리기 (파란색)
+        ax.plot(joint_positions[:, 0], joint_positions[:, 1], joint_positions[:, 2], 
+               'b-', linewidth=4, alpha=alpha, label='로봇 링크')
+        
+        # 조인트 표시 (파란 원)
+        ax.scatter(joint_positions[:-1, 0], joint_positions[:-1, 1], joint_positions[:-1, 2],
+                  c='blue', marker='o', s=80, alpha=alpha, edgecolors='darkblue', linewidths=1.5)
+        
+        # 엔드 이펙터 표시 (빨간 다이아몬드)
+        ax.scatter(joint_positions[-1, 0], joint_positions[-1, 1], joint_positions[-1, 2], 
+                  color='red', s=200, marker='D', alpha=1.0, edgecolors='darkred', linewidths=2,
+                  label='엔드 이펙터')
+        
+        if show_frames:
+            # 베이스 좌표계 표시
+            base_origin = np.array([0, 0, 0])
+            base_rotation = np.eye(3)
+            self.draw_coordinate_frame(ax, base_origin, base_rotation, scale=0.1, label="Base_", alpha=alpha)
+            
+            # 엔드 이펙터 좌표계 표시
+            ee_origin = T[:3, 3]
+            ee_rotation = T[:3, :3]
+            self.draw_coordinate_frame(ax, ee_origin, ee_rotation, scale=0.08, label="EE_", alpha=alpha)
+    
     def inverse_kinematics(self, target_position, target_orientation, initial_guess=None):
         """역방향 운동학"""
         if initial_guess is None:
@@ -139,7 +194,7 @@ class CobotKinematics:
         initial_guess = np.radians(initial_guess_deg)
         
         def objective_function(user_joint_angles):
-            pos, euler, _ = self.forward_kinematics(user_joint_angles)
+            pos, euler, _, _ = self.forward_kinematics(user_joint_angles)
             
             # 위치 오차
             pos_error = target_position - pos
@@ -164,7 +219,7 @@ class CobotKinematics:
             solution = result.x
             
             # 해의 유효성 검증
-            pos, euler, _ = self.forward_kinematics(solution)
+            pos, euler, _, _ = self.forward_kinematics(solution)
             pos_error = np.linalg.norm(target_position - pos)
             orient_error = np.linalg.norm(target_orientation - euler)
             
@@ -1389,6 +1444,8 @@ class RobotControlGUI(Node):
         
         ttk.Button(exec_frame, text="📐 경로 생성 (보간 + IK)", 
                   command=self.generate_trajectory, width=25).pack(side=tk.LEFT, padx=5)
+        ttk.Button(exec_frame, text="📋 데이터 확인", 
+                  command=self.show_trajectory_data, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Button(exec_frame, text="🎨 3D 시각화", 
                   command=self.visualize_3d_path, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Button(exec_frame, text="▶️ 경로 실행", 
@@ -1479,7 +1536,7 @@ class RobotControlGUI(Node):
     
     def get_current_position(self):
         """현재 위치 가져오기 (FK 사용)"""
-        pos, orient, _ = self.robot.forward_kinematics(self.current_angles)
+        pos, orient, _, _ = self.robot.forward_kinematics(self.current_angles)
         
         self.wp_x_entry.delete(0, tk.END)
         self.wp_x_entry.insert(0, f"{pos[0]:.3f}")
@@ -1503,7 +1560,7 @@ class RobotControlGUI(Node):
     
     def goto_home_position(self):
         """Home 위치로 설정"""
-        pos, orient, _ = self.robot.forward_kinematics(np.zeros(6))
+        pos, orient, _, _ = self.robot.forward_kinematics(np.zeros(6))
         
         self.wp_x_entry.delete(0, tk.END)
         self.wp_x_entry.insert(0, f"{pos[0]:.3f}")
@@ -1551,7 +1608,7 @@ class RobotControlGUI(Node):
         self.log_message(f"   - 보간 간격: {interp_step} m")
         
         # 현재 위치를 시작점으로
-        current_pos, current_orient, _ = self.robot.forward_kinematics(self.current_angles)
+        current_pos, current_orient, _, _ = self.robot.forward_kinematics(self.current_angles)
         
         # 모든 경로점을 좌표+자세 배열로 변환
         all_points = []
@@ -1967,18 +2024,16 @@ class RobotControlGUI(Node):
         ax = fig.add_subplot(111, projection='3d')
         
         # 현재 위치
-        current_pos, _, _ = self.robot.forward_kinematics(self.current_angles)
+        current_pos, _, _, current_joint_positions = self.robot.forward_kinematics(self.current_angles)
+        
+        # 🤖 1. 현재 로봇 구조 표시 (파란색 링크)
+        self.robot.plot_robot(self.current_angles, ax, show_frames=True, alpha=0.7)
         
         # 경로점 추출
         waypoint_positions = []
         for wp in self.waypoints:
             waypoint_positions.append([wp[0], wp[1], wp[2]])
         waypoint_positions = np.array(waypoint_positions)
-        
-        # 1. 현재 위치 표시 (큰 별)
-        ax.scatter([current_pos[0]], [current_pos[1]], [current_pos[2]], 
-                  c='green', marker='*', s=500, label='현재 위치', 
-                  edgecolors='darkgreen', linewidths=2)
         
         # 2. 경로점 표시 (빨간 점)
         ax.scatter(waypoint_positions[:, 0], 
@@ -2013,6 +2068,13 @@ class RobotControlGUI(Node):
                       sample_points[:, 1], 
                       sample_points[:, 2],
                       c='cyan', marker='.', s=20, alpha=0.5)
+            
+            # 🤖 경로 상의 로봇 자세 표시 (10개 샘플)
+            if len(self.angle_trajectory) > 0:
+                step = max(len(self.angle_trajectory) // 10, 1)
+                for i in range(0, len(self.angle_trajectory), step):
+                    angles_rad = np.radians(self.angle_trajectory[i])
+                    self.robot.plot_robot(angles_rad, ax, show_frames=False, alpha=0.2)
         
         # 5. 작업 공간 표시 (반투명 박스)
         # 로봇의 대략적인 작업 공간
@@ -2050,7 +2112,7 @@ class RobotControlGUI(Node):
         
         # 7. 제목 및 범례
         path_type = self.path_type_var.get()
-        title = f'3D 경로 시각화 - {path_type.upper()} 보간\n'
+        title = f'🤖 로봇 경로 시뮬레이션 - {path_type.upper()} 보간\n'
         title += f'경로점: {len(self.waypoints)}개'
         if len(self.interpolated_points) > 0:
             title += f' | 보간점: {len(self.interpolated_points)}개'
@@ -2058,7 +2120,7 @@ class RobotControlGUI(Node):
             title += f' | 각도 궤적: {len(self.angle_trajectory)}개'
         
         ax.set_title(title, fontsize=12, weight='bold', pad=20)
-        ax.legend(loc='upper left', fontsize=9)
+        ax.legend(loc='upper left', fontsize=8)
         
         # 8. 그리드 및 배경
         ax.grid(True, alpha=0.3)
@@ -2088,8 +2150,21 @@ class RobotControlGUI(Node):
         info_frame = ttk.Frame(viz_window)
         info_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        info_text = f"💡 팁: 마우스로 드래그하여 회전, 휠로 확대/축소 가능"
-        ttk.Label(info_frame, text=info_text, foreground="blue").pack()
+        # 범례 설명
+        legend_items = []
+        legend_items.append("🤖 파란 링크: 현재 로봇 자세")
+        legend_items.append("🔴 빨간 다이아몬드: 엔드 이펙터")
+        legend_items.append("📍 빨간 원: 경로점")
+        if len(self.interpolated_points) > 0:
+            legend_items.append("🔷 청록 선: 보간 경로")
+        if len(self.angle_trajectory) > 0:
+            legend_items.append("👻 반투명 링크: 경로 상 로봇 자세")
+        
+        info_text = " | ".join(legend_items)
+        ttk.Label(info_frame, text=info_text, foreground="darkblue", font=('Arial', 8)).pack()
+        
+        info_text2 = "💡 팁: 마우스 드래그로 회전, 휠로 확대/축소, 화살표는 좌표계 (빨강=X, 초록=Y, 파랑=Z)"
+        ttk.Label(info_frame, text=info_text2, foreground="blue", font=('Arial', 8)).pack()
         
         # 통계 정보
         stats_frame = ttk.Frame(viz_window)
@@ -2133,8 +2208,54 @@ class RobotControlGUI(Node):
             ax.view_init(elev=20, azim=45)
             canvas.draw()
         
+        def toggle_path_robots():
+            """경로 상 로봇 표시 토글"""
+            ax.clear()
+            
+            # 다시 그리기 (경로 상 로봇 제외)
+            self.robot.plot_robot(self.current_angles, ax, show_frames=True, alpha=0.7)
+            
+            # 경로점
+            ax.scatter(waypoint_positions[:, 0], waypoint_positions[:, 1], waypoint_positions[:, 2],
+                      c='red', marker='o', s=100, label='경로점', edgecolors='darkred', linewidths=1.5)
+            for i, wp in enumerate(waypoint_positions):
+                ax.text(wp[0], wp[1], wp[2], f'  P{i+1}', fontsize=10, color='darkred', weight='bold')
+            
+            # 경로점 연결선
+            all_pts = np.vstack([[current_pos[0], current_pos[1], current_pos[2]], waypoint_positions])
+            ax.plot(all_pts[:, 0], all_pts[:, 1], all_pts[:, 2], 'b-', linewidth=2, alpha=0.6, label='경로점 연결')
+            
+            # 보간 경로
+            if len(self.interpolated_points) > 0:
+                interp_pos = np.array([p[:3] for p in self.interpolated_points])
+                ax.plot(interp_pos[:, 0], interp_pos[:, 1], interp_pos[:, 2],
+                       'c-', linewidth=1, alpha=0.8, label=f'보간 경로')
+            
+            # 작업 공간
+            for edge in edges:
+                points = np.array(edge)
+                ax.plot(points[:, 0], points[:, 1], points[:, 2], 'gray', linestyle='--', linewidth=0.5, alpha=0.3)
+            
+            ax.set_xlabel('X (m)', fontsize=10, weight='bold')
+            ax.set_ylabel('Y (m)', fontsize=10, weight='bold')
+            ax.set_zlabel('Z (m)', fontsize=10, weight='bold')
+            ax.set_title(title, fontsize=12, weight='bold', pad=20)
+            ax.legend(loc='upper left', fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.set_facecolor('#f0f0f0')
+            
+            if len(all_points) > 0:
+                margin = 0.1
+                ax.set_xlim(all_points[:, 0].min() - margin, all_points[:, 0].max() + margin)
+                ax.set_ylim(all_points[:, 1].min() - margin, all_points[:, 1].max() + margin)
+                ax.set_zlim(max(0, all_points[:, 2].min() - margin), all_points[:, 2].max() + margin)
+            
+            canvas.draw()
+            messagebox.showinfo("표시 변경", "경로 상 로봇 표시가 제거되었습니다.\n다시 클릭하면 원래대로 돌아갑니다.")
+        
         ttk.Button(button_frame, text="💾 이미지 저장", command=save_plot).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="🔄 뷰 리셋", command=reset_view).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="🤖 경로 로봇 숨김", command=toggle_path_robots).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="❌ 닫기", command=viz_window.destroy).pack(side=tk.RIGHT, padx=5)
         
         # 로그 메시지
@@ -2142,6 +2263,282 @@ class RobotControlGUI(Node):
         self.log_message(f"   - 경로점: {len(self.waypoints)}개")
         if len(self.interpolated_points) > 0:
             self.log_message(f"   - 보간점: {len(self.interpolated_points)}개")
+        self.log_message("="*50)
+    
+    def show_trajectory_data(self):
+        """📋 보간점 및 각도 데이터 확인 창"""
+        if len(self.waypoints) == 0:
+            messagebox.showwarning("경고", "확인할 경로점이 없습니다.")
+            return
+        
+        self.log_message("="*50)
+        self.log_message("📋 경로 데이터 뷰어 열기...")
+        
+        # 새 창 생성
+        data_window = tk.Toplevel(self.root)
+        data_window.title("📋 경로 데이터 뷰어")
+        data_window.geometry("1100x700")
+        
+        # 탭 노트북 생성
+        notebook = ttk.Notebook(data_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # 탭 1: 경로점 (Waypoints)
+        waypoint_tab = ttk.Frame(notebook)
+        notebook.add(waypoint_tab, text=f"📍 경로점 ({len(self.waypoints)}개)")
+        
+        # 경로점 테이블
+        wp_columns = ('번호', 'X (m)', 'Y (m)', 'Z (m)', 'Roll (°)', 'Pitch (°)', 'Yaw (°)')
+        wp_tree = ttk.Treeview(waypoint_tab, columns=wp_columns, show='headings', height=20)
+        
+        for col in wp_columns:
+            wp_tree.heading(col, text=col)
+            if col == '번호':
+                wp_tree.column(col, width=60, anchor='center')
+            else:
+                wp_tree.column(col, width=100, anchor='center')
+        
+        # 스크롤바
+        wp_scrollbar = ttk.Scrollbar(waypoint_tab, orient=tk.VERTICAL, command=wp_tree.yview)
+        wp_tree.configure(yscrollcommand=wp_scrollbar.set)
+        
+        wp_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        wp_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 데이터 추가
+        for i, wp in enumerate(self.waypoints):
+            wp_tree.insert('', 'end', values=(
+                f'P{i+1}',
+                f'{wp[0]:.4f}',
+                f'{wp[1]:.4f}',
+                f'{wp[2]:.4f}',
+                f'{wp[3]:.2f}',
+                f'{wp[4]:.2f}',
+                f'{wp[5]:.2f}'
+            ))
+        
+        # 탭 2: 보간점 (Interpolated Points)
+        if len(self.interpolated_points) > 0:
+            interp_tab = ttk.Frame(notebook)
+            notebook.add(interp_tab, text=f"📐 보간점 ({len(self.interpolated_points)}개)")
+            
+            # 보간점 테이블
+            interp_columns = ('번호', 'X (m)', 'Y (m)', 'Z (m)', 'Roll (rad)', 'Pitch (rad)', 'Yaw (rad)')
+            interp_tree = ttk.Treeview(interp_tab, columns=interp_columns, show='headings', height=20)
+            
+            for col in interp_columns:
+                interp_tree.heading(col, text=col)
+                if col == '번호':
+                    interp_tree.column(col, width=60, anchor='center')
+                else:
+                    interp_tree.column(col, width=120, anchor='center')
+            
+            # 스크롤바
+            interp_scrollbar = ttk.Scrollbar(interp_tab, orient=tk.VERTICAL, command=interp_tree.yview)
+            interp_tree.configure(yscrollcommand=interp_scrollbar.set)
+            
+            interp_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            interp_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # 데이터 추가
+            for i, point in enumerate(self.interpolated_points):
+                interp_tree.insert('', 'end', values=(
+                    i+1,
+                    f'{point[0]:.6f}',
+                    f'{point[1]:.6f}',
+                    f'{point[2]:.6f}',
+                    f'{point[3]:.6f}',
+                    f'{point[4]:.6f}',
+                    f'{point[5]:.6f}'
+                ))
+        
+        # 탭 3: 각도 궤적 (Angle Trajectory)
+        if len(self.angle_trajectory) > 0:
+            angle_tab = ttk.Frame(notebook)
+            notebook.add(angle_tab, text=f"🎯 각도 궤적 ({len(self.angle_trajectory)}개)")
+            
+            # 각도 테이블
+            angle_columns = ('번호', '서보1 (°)', '서보2 (°)', '서보3 (°)', '서보4 (°)', '서보5 (°)', '서보6 (°)', 'IK 상태')
+            angle_tree = ttk.Treeview(angle_tab, columns=angle_columns, show='headings', height=20)
+            
+            for col in angle_columns:
+                angle_tree.heading(col, text=col)
+                if col == '번호':
+                    angle_tree.column(col, width=60, anchor='center')
+                elif col == 'IK 상태':
+                    angle_tree.column(col, width=80, anchor='center')
+                else:
+                    angle_tree.column(col, width=100, anchor='center')
+            
+            # 스크롤바
+            angle_scrollbar = ttk.Scrollbar(angle_tab, orient=tk.VERTICAL, command=angle_tree.yview)
+            angle_tree.configure(yscrollcommand=angle_scrollbar.set)
+            
+            angle_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            angle_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # 데이터 추가
+            for i, angles in enumerate(self.angle_trajectory):
+                # 각도 범위 체크
+                all_valid = all(-135 <= a <= 135 for a in angles)
+                status = '✅' if all_valid else '⚠️'
+                
+                angle_tree.insert('', 'end', values=(
+                    i+1,
+                    f'{angles[0]:.2f}',
+                    f'{angles[1]:.2f}',
+                    f'{angles[2]:.2f}',
+                    f'{angles[3]:.2f}',
+                    f'{angles[4]:.2f}',
+                    f'{angles[5]:.2f}',
+                    status
+                ))
+        
+        # 하단 정보 및 버튼 프레임
+        bottom_frame = ttk.Frame(data_window)
+        bottom_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # 통계 정보
+        stats_text = f"📊 총계: 경로점 {len(self.waypoints)}개 | "
+        if len(self.interpolated_points) > 0:
+            stats_text += f"보간점 {len(self.interpolated_points)}개 | "
+        if len(self.angle_trajectory) > 0:
+            stats_text += f"각도 궤적 {len(self.angle_trajectory)}개"
+        
+        ttk.Label(bottom_frame, text=stats_text, font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
+        
+        # 버튼들
+        button_frame = ttk.Frame(data_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        def export_to_csv():
+            """CSV로 내보내기"""
+            if len(self.angle_trajectory) == 0:
+                messagebox.showwarning("경고", "내보낼 데이터가 없습니다.")
+                return
+            
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                initialfile=f"trajectory_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            )
+            
+            if not filename:
+                return
+            
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    # 헤더
+                    f.write("번호,서보1,서보2,서보3,서보4,서보5,서보6,X,Y,Z,Roll,Pitch,Yaw\n")
+                    
+                    # 데이터
+                    for i, angles in enumerate(self.angle_trajectory):
+                        f.write(f"{i+1}")
+                        for a in angles:
+                            f.write(f",{a:.4f}")
+                        
+                        # 보간점 좌표도 함께 저장 (있으면)
+                        if i < len(self.interpolated_points):
+                            point = self.interpolated_points[i]
+                            for p in point:
+                                f.write(f",{p:.6f}")
+                        else:
+                            f.write(",,,,,,")
+                        
+                        f.write("\n")
+                
+                self.log_message(f"✅ CSV 내보내기 완료: {os.path.basename(filename)}")
+                messagebox.showinfo("내보내기 완료", f"데이터가 내보내졌습니다:\n{filename}")
+            except Exception as e:
+                self.log_message(f"❌ CSV 내보내기 실패: {str(e)}")
+                messagebox.showerror("내보내기 실패", f"오류 발생:\n{str(e)}")
+        
+        def copy_to_clipboard():
+            """클립보드에 복사"""
+            if len(self.angle_trajectory) == 0:
+                messagebox.showwarning("경고", "복사할 데이터가 없습니다.")
+                return
+            
+            # 현재 선택된 탭 확인
+            current_tab = notebook.index(notebook.select())
+            
+            if current_tab == 0:  # 경로점
+                data_text = "번호\tX\tY\tZ\tRoll\tPitch\tYaw\n"
+                for i, wp in enumerate(self.waypoints):
+                    data_text += f"P{i+1}\t{wp[0]:.4f}\t{wp[1]:.4f}\t{wp[2]:.4f}\t{wp[3]:.2f}\t{wp[4]:.2f}\t{wp[5]:.2f}\n"
+            elif current_tab == 1 and len(self.interpolated_points) > 0:  # 보간점
+                data_text = "번호\tX\tY\tZ\tRoll\tPitch\tYaw\n"
+                for i, point in enumerate(self.interpolated_points):
+                    data_text += f"{i+1}\t{point[0]:.6f}\t{point[1]:.6f}\t{point[2]:.6f}\t{point[3]:.6f}\t{point[4]:.6f}\t{point[5]:.6f}\n"
+            elif len(self.angle_trajectory) > 0:  # 각도 궤적
+                data_text = "번호\t서보1\t서보2\t서보3\t서보4\t서보5\t서보6\n"
+                for i, angles in enumerate(self.angle_trajectory):
+                    data_text += f"{i+1}\t{angles[0]:.2f}\t{angles[1]:.2f}\t{angles[2]:.2f}\t{angles[3]:.2f}\t{angles[4]:.2f}\t{angles[5]:.2f}\n"
+            else:
+                messagebox.showwarning("경고", "복사할 데이터가 없습니다.")
+                return
+            
+            data_window.clipboard_clear()
+            data_window.clipboard_append(data_text)
+            messagebox.showinfo("복사 완료", "데이터가 클립보드에 복사되었습니다.\nExcel이나 텍스트 에디터에 붙여넣기 가능합니다.")
+            self.log_message("✅ 클립보드에 복사됨")
+        
+        def show_statistics():
+            """상세 통계 표시"""
+            if len(self.angle_trajectory) == 0:
+                messagebox.showinfo("통계", "각도 궤적이 생성되지 않았습니다.")
+                return
+            
+            # 통계 계산
+            angles_array = np.array(self.angle_trajectory)
+            
+            stats_msg = "📊 각도 궤적 통계\n\n"
+            
+            for servo_idx in range(6):
+                servo_angles = angles_array[:, servo_idx]
+                stats_msg += f"서보 {servo_idx+1}:\n"
+                stats_msg += f"  최소: {servo_angles.min():.2f}°\n"
+                stats_msg += f"  최대: {servo_angles.max():.2f}°\n"
+                stats_msg += f"  평균: {servo_angles.mean():.2f}°\n"
+                stats_msg += f"  범위: {servo_angles.max() - servo_angles.min():.2f}°\n"
+                
+                # 범위 초과 체크
+                out_of_range = np.sum((servo_angles < -135) | (servo_angles > 135))
+                if out_of_range > 0:
+                    stats_msg += f"  ⚠️ 범위 초과: {out_of_range}개 포인트\n"
+                
+                stats_msg += "\n"
+            
+            # 총 이동량 계산
+            total_movement = 0
+            for servo_idx in range(6):
+                servo_angles = angles_array[:, servo_idx]
+                movement = np.sum(np.abs(np.diff(servo_angles)))
+                total_movement += movement
+            
+            stats_msg += f"총 서보 이동량: {total_movement:.2f}°\n"
+            stats_msg += f"평균 포인트당 이동: {total_movement/len(self.angle_trajectory):.2f}°\n"
+            
+            messagebox.showinfo("상세 통계", stats_msg)
+        
+        ttk.Button(button_frame, text="📋 클립보드 복사", command=copy_to_clipboard).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="💾 CSV 내보내기", command=export_to_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="📊 상세 통계", command=show_statistics).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="❌ 닫기", command=data_window.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        # 도움말
+        help_frame = ttk.Frame(data_window)
+        help_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        help_text = "💡 팁: 탭을 전환하여 경로점, 보간점, 각도 데이터를 확인할 수 있습니다. 클립보드 복사 후 Excel에 붙여넣기 가능합니다."
+        ttk.Label(help_frame, text=help_text, foreground="blue", font=('Arial', 9)).pack()
+        
+        self.log_message("✅ 경로 데이터 뷰어 열림")
+        self.log_message(f"   - 경로점: {len(self.waypoints)}개")
+        if len(self.interpolated_points) > 0:
+            self.log_message(f"   - 보간점: {len(self.interpolated_points)}개")
+        if len(self.angle_trajectory) > 0:
+            self.log_message(f"   - 각도 궤적: {len(self.angle_trajectory)}개")
         self.log_message("="*50)
     
     def visualize_3d_path_embedded(self):
