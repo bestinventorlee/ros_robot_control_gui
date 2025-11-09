@@ -31,26 +31,42 @@ import matplotlib.font_manager as fm
 def setup_matplotlib_korean_font():
     """matplotlib 한글 폰트 설정"""
     try:
-        # Linux/Ubuntu에서 사용 가능한 한글 폰트 찾기
-        font_list = ['NanumGothic', 'NanumBarunGothic', 'DejaVu Sans', 'Liberation Sans']
+        # Linux/Ubuntu에서 사용 가능한 한글 폰트 찾기 (우선순위 순)
+        # 1. Noto Sans CJK (Google Noto - 대부분의 Ubuntu에 기본 포함)
+        # 2. Nanum 폰트 (수동 설치 시)
+        # 3. DejaVu Sans (기본 폰트, 한글 미지원)
+        font_list = [
+            'Noto Sans CJK KR',      # Google Noto (한글)
+            'Noto Sans CJK',         # Google Noto (일반)
+            'NanumGothic',           # 나눔고딕 (수동 설치 시)
+            'NanumBarunGothic',      # 나눔바른고딕
+            'DejaVu Sans',           # 기본 폰트
+            'Liberation Sans'         # 대체 폰트
+        ]
+        
+        # 시스템에 설치된 폰트 목록 확인
+        available_fonts = [f.name for f in fm.fontManager.ttflist]
         
         for font_name in font_list:
-            try:
-                plt.rcParams['font.family'] = font_name
-                plt.rcParams['axes.unicode_minus'] = False  # 마이너스 기호 깨짐 방지
-                # 테스트
-                fig, ax = plt.subplots()
-                ax.text(0.5, 0.5, '한글테스트', fontsize=12)
-                plt.close(fig)
-                print(f"✅ 한글 폰트 설정 완료: {font_name}")
-                return True
-            except:
-                continue
+            # 폰트가 시스템에 있는지 확인
+            if font_name in available_fonts or any(font_name.lower() in f.lower() for f in available_fonts):
+                try:
+                    plt.rcParams['font.family'] = font_name
+                    plt.rcParams['axes.unicode_minus'] = False  # 마이너스 기호 깨짐 방지
+                    # 테스트
+                    fig, ax = plt.subplots(figsize=(1, 1))
+                    ax.text(0.5, 0.5, '한글테스트', fontsize=12)
+                    plt.close(fig)
+                    print(f"✅ 한글 폰트 설정 완료: {font_name}")
+                    return True
+                except Exception as e:
+                    continue
         
         # 모든 폰트 실패 시 기본 sans-serif 사용
         plt.rcParams['font.family'] = 'sans-serif'
         plt.rcParams['axes.unicode_minus'] = False
         print("⚠️ 한글 폰트를 찾을 수 없어 기본 폰트 사용 (한글이 깨질 수 있음)")
+        print("💡 해결: sudo apt install fonts-noto-cjk")
         return False
     except Exception as e:
         print(f"⚠️ 폰트 설정 오류: {e}")
@@ -284,7 +300,8 @@ class RobotControlGUI(Node):
         # ROS2 퍼블리셔 생성
         self.angle_pub = self.create_publisher(Float32MultiArray, 'servo_angles', 10)
         self.coord_pub = self.create_publisher(Float32MultiArray, 'robot_coords', 10)
-        self.angle_speed_pub = self.create_publisher(Float32MultiArray, 'servo_angles_with_speed', 10)
+        # 큐 크기 1로 설정 (최신 메시지만 유지, 적체 방지)
+        self.angle_speed_pub = self.create_publisher(Float32MultiArray, 'servo_angles_with_speed', 1)
         self.coord_speed_pub = self.create_publisher(Float32MultiArray, 'robot_coords_with_speed', 10)
         self.sync_settings_pub = self.create_publisher(Float32MultiArray, 'sync_settings', 10)
         
@@ -1800,7 +1817,11 @@ class RobotControlGUI(Node):
         self.path_thread.start()
     
     def _execute_waypoint_trajectory_thread(self):
-        """웨이포인트 경로 실행 스레드"""
+        """웨이포인트 경로 실행 스레드
+        마스터에서 연속 전송을 감지하여 자동으로 보간 모드로 전환합니다.
+        - 첫 번째 명령: 동기화 모드 (startSyncMovement)
+        - 두 번째 명령부터 (200ms 이내): 보간 모드 (sendDirectCAN)로 자동 전환
+        """
         try:
             speed = float(self.wp_speed_entry.get())
             accel = float(self.wp_accel_entry.get())
@@ -1809,6 +1830,10 @@ class RobotControlGUI(Node):
             self.log_message("✗ 제어 파라미터 오류")
             self.path_executing = False
             return
+        
+        # 딜레이 검증 (마스터의 연속 전송 감지 로직과 호환)
+        if delay_ms > 200:
+            self.log_message(f"⚠️ 딜레이가 200ms를 초과합니다. 마스터의 연속 전송 감지(200ms)와 호환되지 않을 수 있습니다.")
         
         # 프로그레스바 초기화
         self.wp_progress['value'] = 0
@@ -1819,6 +1844,7 @@ class RobotControlGUI(Node):
         self.log_message(f"총 포인트: {len(self.angle_trajectory)}개")
         self.log_message(f"속도: {speed} deg/s, 가속도: {accel} deg/s²")
         self.log_message(f"딜레이: {delay_ms} ms")
+        self.log_message("💡 마스터가 연속 전송을 감지하여 보간 모드로 자동 전환됩니다.")
         
         start_time = time.time()
         
@@ -1827,7 +1853,9 @@ class RobotControlGUI(Node):
                 self.log_message("⚠ 실행 중단됨")
                 break
             
-            # ROS로 전송
+            # ROS로 전송 (servo_angles_with_speed 토픽)
+            # 마스터에서 연속 전송 감지 시 자동으로 보간 모드로 전환됨
+            # 큐 크기 1이므로 이전 메시지는 자동으로 버려짐 (적체 방지)
             self.angle_speed_pub.publish(Float32MultiArray(data=list(angles) + [speed, accel]))
             
             # 현재 각도 업데이트 (목표값, 실제 피드백이 오면 servo_status_callback에서 덮어씀)
@@ -1847,9 +1875,11 @@ class RobotControlGUI(Node):
             )
             
             if i % 10 == 0 or i == len(self.angle_trajectory) - 1:
-                self.log_message(f"진행: {i+1}/{len(self.angle_trajectory)} ({progress:.1f}%)")
+                mode_info = "보간 모드" if i >= 1 else "동기화 모드 → 보간 모드 전환 예정"
+                self.log_message(f"진행: {i+1}/{len(self.angle_trajectory)} ({progress:.1f}%) [{mode_info}]")
             
-            # 딜레이
+            # 딜레이 (마스터의 연속 전송 감지 로직: 200ms 이내)
+            # 딜레이 전에 ROS 메시지가 실제로 전송되도록 약간의 여유 시간 제공
             time.sleep(delay_ms / 1000.0)
         
         self.path_executing = False
