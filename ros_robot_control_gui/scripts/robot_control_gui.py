@@ -25,6 +25,39 @@ matplotlib.use('TkAgg')  # Tkinter와 호환되는 백엔드 사용
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.font_manager as fm
+
+# ✅ 한글 폰트 설정 (네모 깨짐 방지)
+def setup_matplotlib_korean_font():
+    """matplotlib 한글 폰트 설정"""
+    try:
+        # Linux/Ubuntu에서 사용 가능한 한글 폰트 찾기
+        font_list = ['NanumGothic', 'NanumBarunGothic', 'DejaVu Sans', 'Liberation Sans']
+        
+        for font_name in font_list:
+            try:
+                plt.rcParams['font.family'] = font_name
+                plt.rcParams['axes.unicode_minus'] = False  # 마이너스 기호 깨짐 방지
+                # 테스트
+                fig, ax = plt.subplots()
+                ax.text(0.5, 0.5, '한글테스트', fontsize=12)
+                plt.close(fig)
+                print(f"✅ 한글 폰트 설정 완료: {font_name}")
+                return True
+            except:
+                continue
+        
+        # 모든 폰트 실패 시 기본 sans-serif 사용
+        plt.rcParams['font.family'] = 'sans-serif'
+        plt.rcParams['axes.unicode_minus'] = False
+        print("⚠️ 한글 폰트를 찾을 수 없어 기본 폰트 사용 (한글이 깨질 수 있음)")
+        return False
+    except Exception as e:
+        print(f"⚠️ 폰트 설정 오류: {e}")
+        return False
+
+# 프로그램 시작 시 한글 폰트 설정
+setup_matplotlib_korean_font()
 
 
 class CobotKinematics:
@@ -143,13 +176,13 @@ class CobotKinematics:
             direction = rotation_matrix[:, i] * scale
             ax.quiver(origin[0], origin[1], origin[2],
                      direction[0], direction[1], direction[2],
-                     color=colors[i], arrow_length_ratio=0.3, linewidth=2,
+                     color=colors[i], arrow_length_ratio=0.3, linewidth=1.5,
                      alpha=alpha)
             
-            # 축 레이블 표시
+            # 축 레이블 표시 (폰트 크기 축소)
             end_point = origin + direction * 1.2
             ax.text(end_point[0], end_point[1], end_point[2], 
-                   f"{label}{labels[i]}", color=colors[i], fontsize=8, fontweight='bold')
+                   f"{label}{labels[i]}", color=colors[i], fontsize=6, fontweight='bold')
     
     def plot_robot(self, user_joint_angles, ax, show_frames=True, alpha=0.6):
         """로봇 구조 시각화"""
@@ -238,8 +271,10 @@ class RobotControlGUI(Node):
         # 🤖 운동학 객체 생성
         self.robot = CobotKinematics()
         
-        # 📊 현재 각도 (초기값)
-        self.current_angles = np.zeros(6)
+        # 📊 각도 관리 (분리 저장으로 Race Condition 방지)
+        self.current_angles = np.zeros(6)  # 경로 계획용 (명령 전송 시 사용)
+        self.feedback_angles = np.zeros(6)  # 실제 로봇 피드백 (표시 전용)
+        self.feedback_received = False  # 피드백 수신 여부
         
         # 📍 웨이포인트 경로 데이터
         self.waypoints = []  # [(x,y,z,rx,ry,rz), ...]
@@ -1229,32 +1264,63 @@ class RobotControlGUI(Node):
         self.log_message("홈 포지션으로 이동")
     
     def servo_status_callback(self, msg):
-        """서보 상태 피드백 수신"""
+        """서보 상태 피드백 수신
+        
+        마스터에서 전송하는 데이터 형식 (각 서보당 5개 값):
+        [ID1, Current1, Target1, Encoder1, MaxSpeed1, ID2, Current2, ...]
+        총 6개 서보 × 5개 값 = 30개 데이터
+        """
         # 연결 상태 업데이트
         self.last_message_time = time.time()
         self.connection_status = "연결됨"
         
-        if len(msg.data) >= 18:  # 각 서보당 3개 값 (현재각도, 목표각도, 오차)
-            self.update_status_display(msg.data)
-            self.log_message(f"서보 상태 수신: {len(msg.data)}개 데이터")
+        if len(msg.data) >= 30:  # ✅ 각 서보당 5개 값 (ID, 현재각도, 목표각도, 엔코더각도, 최대속도)
+            # 🔄 실제 로봇의 현재 각도를 feedback_angles에 저장 (표시 전용, Race Condition 방지)
+            current_angles_deg = []
+            target_angles_deg = []
             
-        if len(msg.data) >= 24:  # 동기화 완료 결과 (각 서보당 4개 값)
+            for i in range(6):
+                idx = i * 5  # 각 서보는 5개 값
+                if idx + 4 < len(msg.data):
+                    # msg.data[idx + 0]: 서보 ID
+                    current_angles_deg.append(msg.data[idx + 1])  # ✅ 현재 각도
+                    target_angles_deg.append(msg.data[idx + 2])   # 목표 각도
+                    # msg.data[idx + 3]: 엔코더 각도
+                    # msg.data[idx + 4]: 최대 속도
+            
+            if len(current_angles_deg) == 6:
+                self.feedback_angles = np.radians(current_angles_deg)
+                self.feedback_received = True
+            
+            self.update_status_display(msg.data)
+            # 로그는 너무 자주 출력되므로 제거
+            # self.log_message(f"서보 상태 수신: {len(msg.data)}개 데이터")
+            
+        elif len(msg.data) >= 24:  # 이전 형식 호환 (동기화 완료 결과)
             self.update_result_display(msg.data)
             self.log_message(f"동기화 완료 결과 수신: {len(msg.data)}개 데이터")
     
     def update_status_display(self, data):
-        """상태 표시 업데이트"""
+        """상태 표시 업데이트
+        
+        마스터 데이터 형식: [ID1, Current1, Target1, Encoder1, MaxSpeed1, ...]
+        """
         # 기존 항목 삭제
         for item in self.status_tree.get_children():
             self.status_tree.delete(item)
         
-        # 새 상태 추가
+        # 새 상태 추가 (마스터는 5개씩 전송)
         for i in range(6):
-            if i * 3 + 2 < len(data):
-                current_angle = data[i * 3]
-                target_angle = data[i * 3 + 1]
-                error = data[i * 3 + 2]
-                status = "✅" if abs(error) < 2.0 else "⚠️"
+            idx = i * 5  # 각 서보는 5개 값
+            if idx + 4 < len(data):
+                # servo_id = data[idx + 0]
+                current_angle = data[idx + 1]  # 현재 각도
+                target_angle = data[idx + 2]   # 목표 각도
+                # encoder_angle = data[idx + 3]  # 엔코더 각도
+                # max_speed = data[idx + 4]      # 최대 속도
+                
+                error = abs(current_angle - target_angle)
+                status = "✅" if error < 2.0 else "⚠️"
                 
                 self.status_tree.insert('', 'end', values=(
                     f"서보 {i+1}",
@@ -1536,7 +1602,15 @@ class RobotControlGUI(Node):
     
     def get_current_position(self):
         """현재 위치 가져오기 (FK 사용)"""
-        pos, orient, _, _ = self.robot.forward_kinematics(self.current_angles)
+        # 피드백이 있으면 피드백 사용, 없으면 명령값 사용
+        if self.feedback_received and self.connection_status == "연결됨":
+            angles_to_use = self.feedback_angles
+            source = "✅ 로봇 피드백"
+        else:
+            angles_to_use = self.current_angles
+            source = "⚠️ 명령값 (피드백 없음)"
+        
+        pos, orient, _, _ = self.robot.forward_kinematics(angles_to_use)
         
         self.wp_x_entry.delete(0, tk.END)
         self.wp_x_entry.insert(0, f"{pos[0]:.3f}")
@@ -1556,7 +1630,10 @@ class RobotControlGUI(Node):
         self.wp_rz_entry.delete(0, tk.END)
         self.wp_rz_entry.insert(0, f"{np.degrees(orient[2]):.1f}")
         
-        self.log_message(f"현재 위치: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+        # 현재 각도 정보도 표시
+        angles_deg = np.degrees(angles_to_use)
+        self.log_message(f"현재 위치 ({source}): ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+        self.log_message(f"  각도: [{angles_deg[0]:.1f}, {angles_deg[1]:.1f}, {angles_deg[2]:.1f}, {angles_deg[3]:.1f}, {angles_deg[4]:.1f}, {angles_deg[5]:.1f}]°")
     
     def goto_home_position(self):
         """Home 위치로 설정"""
@@ -1584,8 +1661,8 @@ class RobotControlGUI(Node):
     
     def generate_trajectory(self):
         """경로 생성 (보간 + IK)"""
-        if len(self.waypoints) < 1:
-            messagebox.showwarning("경고", "최소 1개의 경로점이 필요합니다.")
+        if len(self.waypoints) < 2:
+            messagebox.showwarning("경고", "최소 2개의 경로점이 필요합니다.\n(현재 위치에서 목표 위치로 이동)")
             return
         
         try:
@@ -1601,14 +1678,29 @@ class RobotControlGUI(Node):
         self.wp_status_label.config(text="상태: 경로 생성 중...", foreground="blue")
         self.log_message("="*50)
         self.log_message("📐 경로 생성 시작...")
+        self.log_message(f"   - 입력된 경로점: {len(self.waypoints)}개")
         
         # 경로 타입 확인
         path_type = self.path_type_var.get()
         self.log_message(f"   - 경로 타입: {path_type}")
         self.log_message(f"   - 보간 간격: {interp_step} m")
         
-        # 현재 위치를 시작점으로
-        current_pos, current_orient, _, _ = self.robot.forward_kinematics(self.current_angles)
+        # 현재 위치를 시작점으로 (피드백이 있으면 피드백 사용, 없으면 명령값 사용)
+        # ⚡ 중요: 경로 생성 시점에 한 번만 복사해서 사용 (Race Condition 방지)
+        if self.feedback_received and self.connection_status == "연결됨":
+            start_angles = self.feedback_angles.copy()  # 복사본 생성
+            feedback_status = "✅ 로봇 피드백"
+        else:
+            start_angles = self.current_angles.copy()  # 복사본 생성
+            feedback_status = "⚠️ 명령값 (피드백 없음)"
+        
+        current_pos, current_orient, _, _ = self.robot.forward_kinematics(start_angles)
+        
+        # 피드백 상태 표시
+        angles_deg = np.degrees(start_angles)
+        self.log_message(f"   - 시작점: 현재 위치 ({feedback_status})")
+        self.log_message(f"     좌표: ({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f})")
+        self.log_message(f"     각도: [{angles_deg[0]:.1f}°, {angles_deg[1]:.1f}°, {angles_deg[2]:.1f}°, {angles_deg[3]:.1f}°, {angles_deg[4]:.1f}°, {angles_deg[5]:.1f}°]")
         
         # 모든 경로점을 좌표+자세 배열로 변환
         all_points = []
@@ -1624,6 +1716,8 @@ class RobotControlGUI(Node):
                              np.radians(rx_deg), 
                              np.radians(ry_deg), 
                              np.radians(rz_deg)])
+        
+        self.log_message(f"   - 총 경로점: {len(all_points)}개 (현재위치 + 입력점 {len(self.waypoints)}개)")
         
         # 프로그레스바 업데이트: 보간 생성 (0-30%)
         self.wp_progress['value'] = 10
@@ -1645,9 +1739,9 @@ class RobotControlGUI(Node):
         
         self.log_message(f"✅ 보간점 생성 완료: {len(self.interpolated_points)}개")
         
-        # IK 계산
+        # IK 계산 (시작 각도를 초기값으로 사용)
         self.angle_trajectory = []
-        prev_angles = self.current_angles.copy()
+        prev_angles = start_angles.copy()  # 경로 시작점의 각도 사용
         
         success_count = 0
         total_points = len(self.interpolated_points)
@@ -1736,7 +1830,7 @@ class RobotControlGUI(Node):
             # ROS로 전송
             self.angle_speed_pub.publish(Float32MultiArray(data=list(angles) + [speed, accel]))
             
-            # 현재 각도 업데이트
+            # 현재 각도 업데이트 (목표값, 실제 피드백이 오면 servo_status_callback에서 덮어씀)
             self.current_angles = np.radians(angles)
             
             # 프로그레스바 업데이트
@@ -2014,14 +2108,17 @@ class RobotControlGUI(Node):
         self.log_message("="*50)
         self.log_message("🎨 3D 경로 시각화 생성 중...")
         
-        # 새 창 생성
+        # 새 창 생성 (크기 증가)
         viz_window = tk.Toplevel(self.root)
         viz_window.title("🎨 3D 경로 시각화")
-        viz_window.geometry("900x700")
+        viz_window.geometry("1100x800")
         
-        # Figure 생성
-        fig = plt.figure(figsize=(10, 8))
+        # Figure 생성 (크기 조정 및 DPI 설정)
+        fig = plt.figure(figsize=(12, 9), dpi=100)
         ax = fig.add_subplot(111, projection='3d')
+        
+        # ✅ 타이트한 레이아웃 사용 (여백 최소화)
+        fig.tight_layout()
         
         # 현재 위치
         current_pos, _, _, current_joint_positions = self.robot.forward_kinematics(self.current_angles)
@@ -2042,10 +2139,10 @@ class RobotControlGUI(Node):
                   c='red', marker='o', s=100, label='경로점',
                   edgecolors='darkred', linewidths=1.5)
         
-        # 경로점 번호 표시
+        # 경로점 번호 표시 (폰트 크기 축소)
         for i, wp in enumerate(waypoint_positions):
             ax.text(wp[0], wp[1], wp[2], f'  P{i+1}', 
-                   fontsize=10, color='darkred', weight='bold')
+                   fontsize=8, color='darkred', weight='bold')
         
         # 3. 경로점 연결선 (파란 선)
         all_points = np.vstack([[current_pos[0], current_pos[1], current_pos[2]], 
@@ -2105,10 +2202,27 @@ class RobotControlGUI(Node):
             ax.plot(points[:, 0], points[:, 1], points[:, 2],
                    'gray', linestyle='--', linewidth=0.5, alpha=0.3)
         
-        # 6. 축 설정
-        ax.set_xlabel('X (m)', fontsize=10, weight='bold')
-        ax.set_ylabel('Y (m)', fontsize=10, weight='bold')
-        ax.set_zlabel('Z (m)', fontsize=10, weight='bold')
+        # 6. 축 설정 (폰트 크기 축소 및 틱 레이블 개선)
+        ax.set_xlabel('X (m)', fontsize=9, weight='bold', labelpad=8)
+        ax.set_ylabel('Y (m)', fontsize=9, weight='bold', labelpad=8)
+        ax.set_zlabel('Z (m)', fontsize=9, weight='bold', labelpad=8)
+        
+        # ✅ 축 틱 레이블 크기 축소 (텍스트 겹침 방지)
+        ax.tick_params(axis='x', labelsize=7, pad=2)
+        ax.tick_params(axis='y', labelsize=7, pad=2)
+        ax.tick_params(axis='z', labelsize=7, pad=2)
+        
+        # ✅ 축 범위 자동 조정 (약간 여유 있게) - 먼저 설정
+        if len(all_points) > 0:
+            margin = 0.15  # 여유 공간 증가
+            ax.set_xlim(all_points[:, 0].min() - margin, all_points[:, 0].max() + margin)
+            ax.set_ylim(all_points[:, 1].min() - margin, all_points[:, 1].max() + margin)
+            ax.set_zlim(max(0, all_points[:, 2].min() - margin), all_points[:, 2].max() + margin)
+        
+        # ✅ 축 틱 개수 제한 (텍스트 겹침 방지)
+        ax.locator_params(axis='x', nbins=5)
+        ax.locator_params(axis='y', nbins=5)
+        ax.locator_params(axis='z', nbins=5)
         
         # 7. 제목 및 범례
         path_type = self.path_type_var.get()
@@ -2119,22 +2233,16 @@ class RobotControlGUI(Node):
         if len(self.angle_trajectory) > 0:
             title += f' | 각도 궤적: {len(self.angle_trajectory)}개'
         
-        ax.set_title(title, fontsize=12, weight='bold', pad=20)
-        ax.legend(loc='upper left', fontsize=8)
+        ax.set_title(title, fontsize=11, weight='bold', pad=15)
+        ax.legend(loc='upper left', fontsize=7, framealpha=0.8)
         
         # 8. 그리드 및 배경
-        ax.grid(True, alpha=0.3)
-        ax.set_facecolor('#f0f0f0')
+        ax.grid(True, alpha=0.3, linewidth=0.5)
+        ax.set_facecolor('#f5f5f5')
         
-        # 9. 축 범위 자동 조정 (약간 여유 있게)
-        if len(all_points) > 0:
-            margin = 0.1
-            ax.set_xlim(all_points[:, 0].min() - margin, all_points[:, 0].max() + margin)
-            ax.set_ylim(all_points[:, 1].min() - margin, all_points[:, 1].max() + margin)
-            ax.set_zlim(max(0, all_points[:, 2].min() - margin), all_points[:, 2].max() + margin)
-        
-        # 10. 동일한 스케일 (선택적)
-        # ax.set_box_aspect([1,1,1])  # 정육면체 비율
+        # 9. 초기 뷰 설정 (줌아웃 효과)
+        ax.view_init(elev=25, azim=45)  # 시야각 설정
+        ax.dist = 8  # ✅ 카메라 거리 (기본값 10, 줌아웃하려면 작게)
         
         # Canvas에 Figure 추가
         canvas = FigureCanvasTkAgg(fig, master=viz_window)
@@ -2163,7 +2271,7 @@ class RobotControlGUI(Node):
         info_text = " | ".join(legend_items)
         ttk.Label(info_frame, text=info_text, foreground="darkblue", font=('Arial', 8)).pack()
         
-        info_text2 = "💡 팁: 마우스 드래그로 회전, 휠로 확대/축소, 화살표는 좌표계 (빨강=X, 초록=Y, 파랑=Z)"
+        info_text2 = "💡 팁: 마우스 드래그로 회전, 휠로 확대/축소, 하단 버튼으로 줌 조절 가능, 화살표는 좌표계 (빨강=X, 초록=Y, 파랑=Z)"
         ttk.Label(info_frame, text=info_text2, foreground="blue", font=('Arial', 8)).pack()
         
         # 통계 정보
@@ -2205,8 +2313,23 @@ class RobotControlGUI(Node):
         
         def reset_view():
             """뷰 리셋"""
-            ax.view_init(elev=20, azim=45)
+            ax.view_init(elev=25, azim=45)
+            ax.dist = 8
             canvas.draw()
+        
+        def zoom_in():
+            """줌 인"""
+            current_dist = ax.dist if hasattr(ax, 'dist') else 10
+            ax.dist = max(current_dist - 1, 5)  # 최소 5
+            canvas.draw()
+            self.log_message(f"🔍 줌 인 (거리: {ax.dist})")
+        
+        def zoom_out():
+            """줌 아웃"""
+            current_dist = ax.dist if hasattr(ax, 'dist') else 10
+            ax.dist = min(current_dist + 1, 15)  # 최대 15
+            canvas.draw()
+            self.log_message(f"🔍 줌 아웃 (거리: {ax.dist})")
         
         def toggle_path_robots():
             """경로 상 로봇 표시 토글"""
@@ -2219,7 +2342,7 @@ class RobotControlGUI(Node):
             ax.scatter(waypoint_positions[:, 0], waypoint_positions[:, 1], waypoint_positions[:, 2],
                       c='red', marker='o', s=100, label='경로점', edgecolors='darkred', linewidths=1.5)
             for i, wp in enumerate(waypoint_positions):
-                ax.text(wp[0], wp[1], wp[2], f'  P{i+1}', fontsize=10, color='darkred', weight='bold')
+                ax.text(wp[0], wp[1], wp[2], f'  P{i+1}', fontsize=8, color='darkred', weight='bold')
             
             # 경로점 연결선
             all_pts = np.vstack([[current_pos[0], current_pos[1], current_pos[2]], waypoint_positions])
@@ -2236,24 +2359,42 @@ class RobotControlGUI(Node):
                 points = np.array(edge)
                 ax.plot(points[:, 0], points[:, 1], points[:, 2], 'gray', linestyle='--', linewidth=0.5, alpha=0.3)
             
-            ax.set_xlabel('X (m)', fontsize=10, weight='bold')
-            ax.set_ylabel('Y (m)', fontsize=10, weight='bold')
-            ax.set_zlabel('Z (m)', fontsize=10, weight='bold')
-            ax.set_title(title, fontsize=12, weight='bold', pad=20)
-            ax.legend(loc='upper left', fontsize=9)
-            ax.grid(True, alpha=0.3)
-            ax.set_facecolor('#f0f0f0')
+            # 축 설정 (개선됨)
+            ax.set_xlabel('X (m)', fontsize=9, weight='bold', labelpad=8)
+            ax.set_ylabel('Y (m)', fontsize=9, weight='bold', labelpad=8)
+            ax.set_zlabel('Z (m)', fontsize=9, weight='bold', labelpad=8)
+            
+            # 축 틱 레이블 크기 축소
+            ax.tick_params(axis='x', labelsize=7, pad=2)
+            ax.tick_params(axis='y', labelsize=7, pad=2)
+            ax.tick_params(axis='z', labelsize=7, pad=2)
+            
+            # 축 틱 개수 제한
+            ax.locator_params(axis='x', nbins=5)
+            ax.locator_params(axis='y', nbins=5)
+            ax.locator_params(axis='z', nbins=5)
+            
+            ax.set_title(title, fontsize=11, weight='bold', pad=15)
+            ax.legend(loc='upper left', fontsize=7, framealpha=0.8)
+            ax.grid(True, alpha=0.3, linewidth=0.5)
+            ax.set_facecolor('#f5f5f5')
             
             if len(all_points) > 0:
-                margin = 0.1
+                margin = 0.15
                 ax.set_xlim(all_points[:, 0].min() - margin, all_points[:, 0].max() + margin)
                 ax.set_ylim(all_points[:, 1].min() - margin, all_points[:, 1].max() + margin)
                 ax.set_zlim(max(0, all_points[:, 2].min() - margin), all_points[:, 2].max() + margin)
+            
+            # 뷰 설정
+            ax.view_init(elev=25, azim=45)
+            ax.dist = 8
             
             canvas.draw()
             messagebox.showinfo("표시 변경", "경로 상 로봇 표시가 제거되었습니다.\n다시 클릭하면 원래대로 돌아갑니다.")
         
         ttk.Button(button_frame, text="💾 이미지 저장", command=save_plot).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="🔍+ 줌 인", command=zoom_in).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="🔍- 줌 아웃", command=zoom_out).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="🔄 뷰 리셋", command=reset_view).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="🤖 경로 로봇 숨김", command=toggle_path_robots).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="❌ 닫기", command=viz_window.destroy).pack(side=tk.RIGHT, padx=5)
