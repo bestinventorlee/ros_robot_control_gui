@@ -1521,6 +1521,15 @@ class RobotControlGUI(Node):
         path_type_combo['values'] = ('linear', 'circular', 'bezier')
         path_type_combo.grid(row=4, column=1, padx=5, pady=5)
         
+        # 전송 방식 선택
+        ttk.Label(param_frame, text="전송 방식:").grid(row=5, column=0, sticky=tk.W, pady=5)
+        self.wp_send_mode_var = tk.StringVar(value="one_by_one")
+        send_mode_combo = ttk.Combobox(param_frame, textvariable=self.wp_send_mode_var, width=13, state='readonly')
+        send_mode_combo['values'] = ('one_by_one', 'batch')
+        send_mode_combo.grid(row=5, column=1, padx=5, pady=5)
+        ttk.Label(param_frame, text="(one_by_one: 하나씩 전송, batch: 한꺼번에 전송)", 
+                 font=('TkDefaultFont', 8)).grid(row=5, column=2, padx=5, pady=5, sticky=tk.W)
+        
         # 실행 버튼
         exec_frame = ttk.Frame(waypoint_frame)
         exec_frame.grid(row=2, column=0, columnspan=2, pady=10)
@@ -1818,44 +1827,59 @@ class RobotControlGUI(Node):
     
     def _execute_waypoint_trajectory_thread(self):
         """웨이포인트 경로 실행 스레드
-        마스터에서 연속 전송을 감지하여 자동으로 보간 모드로 전환합니다.
-        - 첫 번째 명령: 동기화 모드 (startSyncMovement)
-        - 두 번째 명령부터 (200ms 이내): 보간 모드 (sendDirectCAN)로 자동 전환
+        전송 방식에 따라 두 가지 모드를 지원합니다:
+        1. one_by_one: 각도값을 하나씩 전송할 때마다 마스터가 즉시 슬레이브에 브로드캐스팅
+        2. batch: 각도값 배열을 한꺼번에 전송하고 마스터가 하나씩 브로드캐스팅
         """
         try:
             speed = float(self.wp_speed_entry.get())
             accel = float(self.wp_accel_entry.get())
             delay_ms = float(self.wp_delay_entry.get())
+            interval = delay_ms / 1000.0  # ms를 초로 변환
         except ValueError:
             self.log_message("✗ 제어 파라미터 오류")
             self.path_executing = False
             return
         
-        # 딜레이 검증 (마스터의 연속 전송 감지 로직과 호환)
-        if delay_ms > 200:
-            self.log_message(f"⚠️ 딜레이가 200ms를 초과합니다. 마스터의 연속 전송 감지(200ms)와 호환되지 않을 수 있습니다.")
+        if len(self.angle_trajectory) == 0:
+            self.log_message("❌ 각도 궤적이 없습니다. 먼저 경로를 생성하세요.")
+            self.path_executing = False
+            return
         
+        # 전송 방식 확인
+        send_mode = self.wp_send_mode_var.get()
+        
+        if send_mode == "batch":
+            # 배치 모드: 각도값 배열을 한꺼번에 전송
+            self._execute_batch_mode(speed, accel, interval, delay_ms)
+        else:
+            # one_by_one 모드: 각도값을 하나씩 전송
+            self._execute_one_by_one_mode(speed, accel, delay_ms)
+    
+    def _execute_one_by_one_mode(self, speed, accel, delay_ms):
+        """각도값을 하나씩 전송하는 모드"""
         # 프로그레스바 초기화
         self.wp_progress['value'] = 0
         self.wp_progress['maximum'] = len(self.angle_trajectory)
         
         self.log_message("="*50)
-        self.log_message("▶️ 웨이포인트 경로 실행 시작...")
+        self.log_message("▶️ 웨이포인트 경로 실행 시작 (각도값 하나씩 전송 모드)...")
         self.log_message(f"총 포인트: {len(self.angle_trajectory)}개")
+        self.log_message(f"전송 간격: {delay_ms}ms")
         self.log_message(f"속도: {speed} deg/s, 가속도: {accel} deg/s²")
-        self.log_message(f"딜레이: {delay_ms} ms")
-        self.log_message("💡 마스터가 연속 전송을 감지하여 보간 모드로 자동 전환됩니다.")
+        self.log_message("💡 각도값을 받는 즉시 마스터가 슬레이브에 브로드캐스팅합니다.")
+        self.log_message("💡 슬레이브는 목표값에 도달하지 않았더라도 최신 데이터로 목표값을 업데이트합니다.")
         
         start_time = time.time()
         
+        # 각도값을 하나씩 전송
         for i, angles in enumerate(self.angle_trajectory):
             if not self.path_executing:
                 self.log_message("⚠ 실행 중단됨")
                 break
             
             # ROS로 전송 (servo_angles_with_speed 토픽)
-            # 마스터에서 연속 전송 감지 시 자동으로 보간 모드로 전환됨
-            # 큐 크기 1이므로 이전 메시지는 자동으로 버려짐 (적체 방지)
+            # 마스터가 받는 즉시 sendDirectCAN()을 호출하여 슬레이브에 브로드캐스팅
             self.angle_speed_pub.publish(Float32MultiArray(data=list(angles) + [speed, accel]))
             
             # 현재 각도 업데이트 (목표값, 실제 피드백이 오면 servo_status_callback에서 덮어씀)
@@ -1867,7 +1891,7 @@ class RobotControlGUI(Node):
             # 진행 상황 업데이트
             progress = (i+1) / len(self.angle_trajectory) * 100
             elapsed = time.time() - start_time
-            remaining = (elapsed / (i+1)) * (len(self.angle_trajectory) - i - 1)
+            remaining = (elapsed / (i+1)) * (len(self.angle_trajectory) - i - 1) if i > 0 else 0
             
             self.wp_status_label.config(
                 text=f"상태: 실행 중... ({i+1}/{len(self.angle_trajectory)}, {progress:.0f}%, 남은시간: {remaining:.1f}초)", 
@@ -1875,11 +1899,9 @@ class RobotControlGUI(Node):
             )
             
             if i % 10 == 0 or i == len(self.angle_trajectory) - 1:
-                mode_info = "보간 모드" if i >= 1 else "동기화 모드 → 보간 모드 전환 예정"
-                self.log_message(f"진행: {i+1}/{len(self.angle_trajectory)} ({progress:.1f}%) [{mode_info}]")
+                self.log_message(f"진행: {i+1}/{len(self.angle_trajectory)} ({progress:.1f}%) - 각도값 전송 및 브로드캐스팅 완료")
             
-            # 딜레이 (마스터의 연속 전송 감지 로직: 200ms 이내)
-            # 딜레이 전에 ROS 메시지가 실제로 전송되도록 약간의 여유 시간 제공
+            # 딜레이 (다음 각도값 전송 전 대기)
             time.sleep(delay_ms / 1000.0)
         
         self.path_executing = False
@@ -1887,6 +1909,66 @@ class RobotControlGUI(Node):
         self.log_message(f"✅ 웨이포인트 경로 실행 완료! (총 {total_time:.1f}초)")
         self.wp_status_label.config(text="상태: 실행 완료", foreground="green")
         self.wp_progress['value'] = len(self.angle_trajectory)
+    
+    def _execute_batch_mode(self, speed, accel, interval, delay_ms):
+        """각도값 배열을 한꺼번에 전송하는 모드"""
+        # 프로그레스바 초기화
+        self.wp_progress['value'] = 0
+        self.wp_progress['maximum'] = 100
+        
+        self.log_message("="*50)
+        self.log_message("▶️ 웨이포인트 경로 실행 시작 (각도값 배열 한꺼번에 전송 모드)...")
+        self.log_message(f"총 포인트: {len(self.angle_trajectory)}개")
+        self.log_message(f"전송 간격: {interval:.3f}초 ({delay_ms}ms)")
+        self.log_message(f"속도: {speed} deg/s, 가속도: {accel} deg/s²")
+        self.log_message("💡 각도값 배열을 한꺼번에 마스터에 전송하고, 마스터가 하나씩 브로드캐스팅합니다.")
+        
+        # 각도값 배열을 path_command 메시지 형식으로 변환
+        # 형식: [-999.0 (각도값 배열 모드 표시), 포인트 개수, 각도1_1, 각도1_2, ..., 각도1_6, 각도2_1, ..., 각도N_6, interval, speed]
+        num_points = len(self.angle_trajectory)
+        msg_data = [-999.0]  # 각도값 배열 모드 표시
+        msg_data.append(float(num_points))
+        
+        # 각도값 배열 추가
+        for angles in self.angle_trajectory:
+            msg_data.extend(angles)
+        
+        # 파라미터 추가
+        msg_data.append(interval)
+        msg_data.append(speed)
+        
+        # path_command 메시지 전송
+        msg = Float32MultiArray()
+        msg.data = msg_data
+        
+        self.log_message(f"📤 각도값 배열 전송: {num_points}개 포인트, 총 {len(msg_data)}개 데이터")
+        self.path_command_pub.publish(msg)
+        
+        # 마스터가 경로 실행을 완료할 때까지 대기
+        # 예상 실행 시간: num_points * interval
+        estimated_duration = num_points * interval
+        
+        self.log_message(f"⏳ 마스터 경로 실행 대기 중... (예상 시간: {estimated_duration:.1f}초)")
+        
+        # 진행 상황 업데이트 (대기 중)
+        elapsed = 0.0
+        update_interval = 0.1  # 100ms마다 업데이트
+        while elapsed < estimated_duration and self.path_executing:
+            time.sleep(update_interval)
+            elapsed += update_interval
+            progress = min(100, (elapsed / estimated_duration) * 100)
+            self.wp_progress['value'] = progress
+            
+            self.wp_status_label.config(
+                text=f"상태: 실행 중... ({progress:.0f}%, 남은시간: {estimated_duration - elapsed:.1f}초)", 
+                foreground="blue"
+            )
+        
+        self.path_executing = False
+        total_time = elapsed
+        self.log_message(f"✅ 웨이포인트 경로 실행 완료! (총 {total_time:.1f}초)")
+        self.wp_status_label.config(text="상태: 실행 완료", foreground="green")
+        self.wp_progress['value'] = 100
     
     def stop_waypoint_execution(self):
         """웨이포인트 경로 실행 정지"""
