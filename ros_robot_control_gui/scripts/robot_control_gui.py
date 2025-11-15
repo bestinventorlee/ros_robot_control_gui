@@ -725,7 +725,8 @@ class RobotControlGUI(Node):
         accel = self.accel_var.get()
         
         msg = Float32MultiArray()
-        msg.data = angles + [speed, accel]
+        # 형식: [각도1-6, 속도, 가속도, 모드] (모드: 0.0 = 일반 명령, 1.0 = 웨이포인트 모드)
+        msg.data = angles + [speed, accel, 0.0]  # 일반 명령이므로 모드 = 0.0
         
         print(f"GUI 전송: 각도={angles}, 속도={speed}, 가속도={accel}")
         print(f"메시지 데이터 크기: {len(msg.data)}")
@@ -1888,7 +1889,8 @@ class RobotControlGUI(Node):
             
             # ROS로 전송 (servo_angles_with_speed 토픽)
             # 마스터가 받는 즉시 sendDirectCAN()을 호출하여 슬레이브에 브로드캐스팅
-            self.angle_speed_pub.publish(Float32MultiArray(data=list(angles) + [speed, accel]))
+            # 형식: [각도1-6, 속도, 가속도, 모드] (모드: 1.0 = 웨이포인트 모드)
+            self.angle_speed_pub.publish(Float32MultiArray(data=list(angles) + [speed, accel, 1.0]))
             
             # 현재 각도 업데이트 (목표값, 실제 피드백이 오면 servo_status_callback에서 덮어씀)
             self.current_angles = np.radians(angles)
@@ -1911,6 +1913,11 @@ class RobotControlGUI(Node):
             
             # 딜레이 (다음 각도값 전송 전 대기)
             time.sleep(delay_ms / 1000.0)
+        
+        # 마지막 메시지 전송 후, 마스터가 웨이포인트 모드를 종료하도록 충분한 시간 대기
+        # 마스터는 마지막 메시지 후 200ms 이상 지나면 웨이포인트 모드를 종료함
+        self.log_message("⏳ 웨이포인트 모드 종료 대기 중...")
+        time.sleep(0.25)  # 250ms 대기하여 마스터가 웨이포인트 모드를 종료하도록 함
         
         self.path_executing = False
         total_time = time.time() - start_time
